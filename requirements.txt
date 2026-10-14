@@ -2,3 +2,10 @@ numpy
 pandas
 matplotlib
 biopython
+
+# Optional. Makes the minimum free energy step local and much faster;
+# without it, --mfe uses the public RNAfold web server instead.
+# ViennaRNA
+
+# Optional. Needed only by tool/lanl_hxb2_gff3.py, not by the pipeline.
+# openpyxl

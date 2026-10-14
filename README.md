@@ -1,704 +1,983 @@
-# HIV-1 LTR gRNA Designer
+# gRNA Designer
 
-This tool searches for SpCas9 guide RNAs targeting the HIV-1 LTR (long
-terminal repeat, a sequence that appears identically at both ends of every
-integrated HIV provirus) that stay effective across a 365-sequence panel of
-real HIV-1 subtype-B sequences, rather than being designed against a single
-reference genome and hoping it generalizes. It also optionally checks
-candidates against the human genome to flag guides that might also cut
-somewhere they shouldn't.
+Design a guide RNA against a **population** of a target rather than against a
+single reference sequence.
 
-No biology background is assumed anywhere in this document — every term is
-defined the first time it's used, and section 4 formalizes every score with
-an explicit equation and variable list.
+Give the tool an aligned sequence set, the PAM motif of your nuclease, and an
+annotated reference. It slides a protospacer window along both strand, keeps
+every window that is cuttable across the whole panel, and scores each survivor
+on four independent axis. It then reports where each guide lands on the
+reference and what it hits, and draws the result as one map.
 
-## 1. What it needs to run
+Nothing in the pipeline is organism specific. The nuclease is whatever PAM
+motif you give it, the reference is whatever annotated sequence you point at,
+and the panel is any aligned FASTA. It was written for an OSU iGEM project
+targeting the integrated HIV-1 provirus, and that case is carried through
+section 11 as a worked example, but no step assumes it and none of that data
+is part of this repository.
 
-The tool needs three things on disk before it can do anything:
 
-- **An aligned FASTA panel** — `input/hiv-db.fasta` by default.
-  "Aligned" means all 365 sequences have already been stretched/padded (with
-  `-` gap characters) so that column number `i` refers to the same
-  biological position across every sequence — this alignment step is
-  assumed already done; this tool does not do any alignment itself. Each
-  sequence is 866 columns long. Besides the four DNA letters and gaps, a
-  handful of columns contain IUPAC ambiguity codes (`M, Y, R, N, K, W`) — a
-  sequencer's way of saying "couldn't confidently call a single base here."
-- **Two small CFD lookup tables** — `data/mismatch_score.pkl` and
-  `data/pam_scores.pkl`. CFD ("Cutting Frequency Determination") is a
-  published, experimentally-measured model (Doench et al. 2016 — the same
-  numbers CRISPOR uses) of how much a mismatch or an imperfect PAM reduces
-  Cas9 cutting. These tables are the actual measured numbers, not something
-  this project invented — reproduced in full in section 7 so you can see
-  exactly where every score comes from. The loader tells the two files
-  apart by looking at their key structure rather than trusting the
-  filename, so it doesn't matter which order you hand them in.
-- **(Optional) a reference genome** — only needed if you want the off-target
-  step (section 3) to actually run a search; without it, everything else
-  in the tool works fine, and the off-target columns are just left blank.
+## Contents
 
-The FASTA panel lives under `input/`, the two CFD tables live under `data/`,
-and every run's output (`gRNA_table.tsv`, `plots/`) lands under `output/` by
-default — all three paths are set once in `config.py` and used everywhere
-else, so moving any of these directories just means updating `config.py`,
-not hunting through the codebase.
+1. [Overview](#1-overview)
+2. [Biological Background](#2-biological-background)
+3. [Install](#3-install)
+4. [Usage](#4-usage)
+5. [Input](#5-input)
+6. [Output](#6-output)
+7. [Data Process](#7-data-process)
+8. [Coordinate & Strand](#8-coordinate--strand)
+9. [File Map](#9-file-map)
+10. [Test](#10-test)
+11. [Targeting the HIV-1 Provirus](#11-targeting-the-hiv-1-provirus)
+12. [Limitation](#12-limitation)
+13. [Reference](#13-reference)
 
-## 2. What the tool actually does, step by step
 
-1. **Load the alignment, then mirror it.** `io_fasta.py` reads the FASTA,
-   then builds its full reverse complement (every base swapped to its
-   Watson–Crick partner — A↔T, C↔G — and the sequence order flipped). Guides
-   on the minus strand are found by re-running the *exact same* search logic
-   against this mirrored alignment, rather than by trying to read a sequence
-   backwards in place, which is a much easier place to introduce a subtle
-   bug.
-2. **Compute per-column statistics, on both alignments separately.**
-   `columns.py` computes, for every column: the base frequencies and gap
-   fraction, a majority-vote consensus base, and Shannon entropy — a
-   standard measure of how mixed a column is (0 = every sequence agrees,
-   higher = more disagreement). Ambiguity codes are excluded from a
-   column's denominator rather than being treated as a real base.
-3. **Load the CFD tables.** `cfd.py` figures out which pickle is which,
-   then exposes the atomic scoring function and a derived "how much does a
-   mismatch hurt at each of the 20 spacer positions" weight vector — pulled
-   out of the real data, not hand-tuned.
-4. **Slide a 23-column window across both strands and filter it down.**
-   `windows.py` considers every possible 20-nt spacer + 3-nt PAM window
-   (`NGG` — SpCas9 requires this exact 3-letter pattern immediately next to
-   any site it cuts; `N` = any base, so only the two `G`s are fixed). A
-   window is thrown out immediately, before any scoring, if:
-   - **the gap gate fails** — any of its 23 columns has more gaps than
-     `g_max` allows (default 10%), meaning too much of the panel doesn't
-     actually have a real base there; or
-   - **the PAM gate fails** — fewer than `p_pam_min` of the panel (default
-     80%) actually carries `GG` at the PAM position, meaning Cas9 couldn't
-     cut most of the swarm here even with a perfect spacer.
-5. **Score every window that survives.** `score.py` computes a
-   seed-weighted conservation score and two different estimates of expected
-   cutting activity across the panel (see section 4 for exact formulas).
-6. **Assemble the results table.** `table.py` merges both strands' surviving
-   windows onto one shared coordinate system (section 6) and writes one row
-   per guide.
-7. **(Optional) off-target scoring.** `offtarget.py`, wired up through
-   `--genome` / `--offinder-results` (section 3), only runs if you ask for
-   it.
-8. **(Optional) diagnostics on a shortlist.** `diagnostics.py` — meant to be
-   called by hand on guides you've already picked out, not run automatically
-   on the whole table.
-9. **(Optional) plots.** `plotting.py` — see the very last section of this
-   document.
+## 1. Overview
 
-Four different questions are kept deliberately separate the whole way
-through, and never combined into a single score: how *conserved* a region is
-(Shannon entropy), how much a *specific mismatch* is tolerated (CFD), how
-*efficiently* Cas9 cuts a perfect match in the first place (not modeled here
-— that's a separate tool like Azimuth/DeepSpCas9), and whether a guide
-overlaps something the virus can't afford to mutate, like a regulatory
-element (also not modeled here). Each answers a different question, so
-merging them into one number would just hide information.
+**Input.** An aligned FASTA panel, a PAM motif, and optionally an annotated
+reference.
 
-## 3. Running it
+**Output.** A TSV of candidate guide, each scored on four independent axis and
+located on the reference, plus a one figure map of the whole locus.
 
-The entry point is `gRNADesign.py`. It always takes two optional positional
-arguments — input FASTA, then output TSV path — defaulting to whatever is
-configured in `config.py` if you don't supply them:
+**What it does, in one pass:**
+
+```
+read the alignment
+  -> per column frequency, consensus and Shannon entropy
+  -> anchor the panel to the reference, checking orientation first
+  -> slide a (spacer + PAM) window along both strand
+       gate: gap content low, consensus PAM usable, PAM present across the panel
+  -> score every survivor: entropy mean, PAM conservation, mean CFD
+  -> fold each guide for its minimum free energy          (optional)
+  -> report position, gene and regulatory element         (needs a reference)
+  -> write the table, and draw the map                    (optional)
+```
+
+Everything is driven from the command line, with every default in one file,
+`config.py`. Nothing is organism specific: section 11 works the HIV-1 provirus
+through as an example, but no step assumes it.
+
+
+## 2. Biological Background
+
+### Why One Reference Is Not Enough
+
+A guide designed against a single published genome often fails in practice,
+because the thing being cut is not one genome. It is a population: the
+quasispecies of a virus, a bacterial species with strain variation, a gene
+family with paralogue. HIV-1 is the extreme case, mutating fast enough that one
+infected person carries a swarm of variant rather than a single sequence.
+
+Cas9 is sensitive enough for that to matter. One mismatch in the wrong place,
+or a PAM that has drifted, is enough to stop the cut. So a guide that looks
+perfect against the reference can miss most of what is actually there.
+
+Designing against an **alignment** of many real sequence turns the problem into
+a question about column: which stretch of this locus is conserved enough, and
+tolerant enough, that one guide still cuts nearly everything in the panel.
+
+### What Each Metric Measures
+
+| Metric | The question it answers | Biology behind it |
+| --- | --- | --- |
+| **Shannon entropy** | How variable is this locus across the panel? | A conserved stretch is usually one the organism cannot easily change, because it is functionally constrained: a structural RNA element, a promoter motif, a catalytic residue. Those are harder places for an escape mutation to appear |
+| **PAM conservation** | Does the PAM itself survive across the panel? | No PAM, no cut, however good the spacer. Cas9 needs that motif present in the target DNA, so the PAM is a point of failure separate from the protospacer |
+| **CFD score** | Given the variation that *is* there, how much cutting survives? | Not every mismatch matters equally. One far from the PAM is often tolerated; one in the PAM proximal seed region usually is not. CFD puts a published number on that asymmetry |
+| **Minimum free energy** | Does the guide fold up on itself? | A spacer that forms a strong hairpin is less available to load into the nuclease and to pair with its target, so it underperforms however good the target site is |
+
+### Why They Are Kept Apart
+
+Entropy and CFD are deliberately **not** fused into a single rank. They can
+disagree, and the disagreement is the information: a locus can be variable in a
+way CFD tolerates, or conserved in a way one mismatch still ruins. Collapsing
+them hides exactly the case worth looking at. PAM conservation and MFE describe
+different failure mode again.
+
+Ranking is therefore left to you, because the right trade off depends on the
+experiment.
+
+
+## 3. Install
 
 ```bash
-python gRNADesign.py                       # uses config.py's defaults
-python gRNADesign.py my_panel.fasta results.tsv
+pip install -r requirements.txt
 ```
 
-That first line is shorthand for spelling every one of those same defaults
-out explicitly — useful as a template if you want to start from the current
-settings and only change one or two flags:
+Required: `numpy`, `pandas`, `matplotlib`, `biopython`.
+
+Optional:
+
+- `ViennaRNA` makes folding local and much faster. Without it, `--mfe` uses the
+  public RNAfold web server through the standard library, so nothing extra is
+  needed.
+- `openpyxl` is needed only by the converter in `tool/`, never by the pipeline.
+
+
+## 4. Usage
+
+### Command
+
+```
+python gRNADesign.py ALIGNMENT [OUT] [option]
+```
+
+`ALIGNMENT` is required. `OUT` defaults to `output/gRNA_table.tsv`. Everything
+else is optional, and every default lives in `config.py`.
 
 ```bash
-python gRNADesign.py input/hiv-db.fasta output/gRNA_table.tsv \
-  --mm-pickle data/mismatch_score.pkl \
-  --pam-pickle data/pam_scores.pkl \
-  --g-max 0.10 \
-  --p-pam-min 0.80 \
-  --plots output/plots
+# A GenBank reference carries its own annotation, so one file is enough
+python gRNADesign.py panel.fasta --reference genome.gb
+
+# A FASTA reference with a separate GFF3, GTF or BED
+python gRNADesign.py panel.fasta --reference genome.fasta --annotation genome.gff3
+
+# No reference at all: score the panel, leave position and annotation empty
+python gRNADesign.py panel.fasta
+
+# A different nuclease
+python gRNADesign.py panel.fasta --pam TTTV --pam-side 5prime --spacer-length 23
 ```
 
-Every run prints its progress, ending with something like:
+### Every Flag
 
-```
-Total candidates: 31
-No --genome or --offinder-results given; skipping off-target scoring.
-Wrote 31 rows to output/gRNA_table.tsv
-```
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `ALIGNMENT` | required | Aligned FASTA panel |
+| `OUT` | `output/gRNA_table.tsv` | Output TSV |
+| `--reference` | none | Annotated reference, GenBank or FASTA |
+| `--annotation` | none | Separate GFF3, GTF or BED |
+| `--reference-region START END` | none | **Restrict** anchoring to one span, 1 based, both end included. Omit to search the whole reference |
+| `--pam` | `NGG` | IUPAC PAM motif |
+| `--pam-side` | `3prime` | `3prime` (Cas9 like) or `5prime` (Cas12a like) |
+| `--spacer-length` | `20` | Protospacer length |
+| `--max-gap-fraction` | `0.10` | Gate 1: max gap in any window column |
+| `--min-pam-fraction` | `0.80` | Gate 3: min panel fraction with a usable PAM |
+| `--core-gap-fraction` | `0.50` | Max gap for a column to be allowed to anchor |
+| `--mfe` | off | Fold every guide |
+| `--mfe-backend` | `auto` | `auto`, `local` or `server` |
+| `--mfe-url` | ViennaRNA server | RNAfold endpoint |
+| `--mfe-temperature` | `37` | Folding temperature, °C |
+| `--mfe-worker` | `4` | Concurrent server job |
+| `--mfe-cache` | `data/mfe_cache.json` | Fold cache |
+| `--scaffold` | empty | Appended to the spacer before folding |
+| `--plot [PATH]` | off | Draw the candidate map |
+| `--entropy-window` | `20` | Running mean window for the entropy line |
+| `--cfd-line` | none | Optional guide line on the CFD panel |
+| `--consensus [PATH]` | off | Write the panel consensus FASTA |
 
-Below is every flag, explained individually:
+### A Complete Example
 
-- **`fasta`** *(positional, optional)* — path to the aligned input FASTA.
-  Defaults to `config.py`'s `fasta_path`.
-- **`out`** *(positional, optional)* — path to write the output TSV.
-  Defaults to `config.py`'s `table_path`.
-- **`--mm-pickle`** — path to the CFD mismatch-score pickle. You'd only
-  override this if you have a different/updated CFD table than the bundled
-  one. Defaults to `config.py`'s `mm_pickle_path`.
-- **`--pam-pickle`** — same idea, for the CFD PAM-score pickle. Defaults to
-  `config.py`'s `pam_pickle_path`.
-- **`--g-max`** — the gap gate threshold (default `0.10`). Lower = stricter:
-  a smaller fraction of the panel is allowed to have a gap anywhere in the
-  23-column window before it's rejected. Raise this if you're getting very
-  few candidates and are okay with somewhat gappier regions.
-- **`--p-pam-min`** — the PAM gate threshold (default `0.80`). Higher =
-  stricter: a larger fraction of the panel must actually carry `GG` at the
-  PAM position. Lower this if you want to consider PAMs that are only
-  conserved in, say, 60% of the panel.
-- **`--genome`** — path to a reference genome (e.g. an unmasked GRCh38
-  directory) to search for off-targets. Supplying this is what turns the
-  off-target step on at all; without it, off-target scoring is skipped
-  entirely and those two output columns stay blank. See the dedicated
-  walkthrough below for exactly what happens when you use this.
-- **`--offinder-query`** — where to write the Cas-OFFinder query file that
-  `--genome` generates. Defaults to `<out>.offinder_in.txt`. You'd only set
-  this if you want a specific filename/location.
-- **`--offinder-results`** — path to a Cas-OFFinder output file that was
-  already generated (by this tool or by hand, possibly on a different
-  machine). Supplying this skips the search step entirely and jumps
-  straight to scoring those results — it's the "I already searched, just
-  tell me what it means" flag, as opposed to `--genome`'s "search for me."
-  If both `--genome` and `--offinder-results` are given, `--offinder-results`
-  wins and `--genome` is ignored.
-- **`--offinder-mm`** — how many mismatches Cas-OFFinder is allowed to find
-  (default `4`). Higher = broader/slower search, catching more distant
-  off-targets; the default is already generous because the LTR resembles
-  some human endogenous-retrovirus-derived repeats, so a stingy mismatch
-  budget risks silently missing real off-targets.
-- **`--plots`** *(optional value)* — off by default (no plots generated).
-  Passing `--plots` with no value turns plotting on and writes the three
-  diagnostic figures described at the end of this document to
-  `config.py`'s `plots_dir` (`output/plots` by default). Passing
-  `--plots OUT_DIR` turns plotting on and writes them to `OUT_DIR` instead.
+Every flag at once, against the HIV-1 data from section 11. None of those file
+are in this repository; section 11 has the command that fetch them.
 
-**The off-target step, walked through concretely.** Off-target scoring is
-entirely optional and only touches disk/runs anything if you ask for it via
-one of the two flags above.
-
-If you pass `--genome`:
 ```bash
-python gRNADesign.py my_panel.fasta results.tsv --genome /path/to/GRCh38_dir
+python gRNADesign.py \
+    input/hiv-db_gap_squeeze.fasta \
+    output/gRNA_table.tsv \
+    --reference input/K03455.gb \
+    --annotation input/HXB2.gff3 \
+    --reference-region 1 634 \
+    --pam NGG \
+    --pam-side 3prime \
+    --spacer-length 20 \
+    --max-gap-fraction 0.10 \
+    --min-pam-fraction 0.80 \
+    --core-gap-fraction 0.50 \
+    --mfe \
+    --mfe-backend auto \
+    --mfe-temperature 37 \
+    --mfe-worker 4 \
+    --mfe-cache data/mfe_cache.json \
+    --scaffold "" \
+    --plot output/gRNA_map.png \
+    --entropy-window 20 \
+    --cfd-line 0.8 \
+    --consensus output/consensus.fasta
 ```
-this writes a Cas-OFFinder query file, then checks whether the `cas-offinder`
-program is installed (found on your system `PATH`). If it is, the tool runs
-it automatically and merges the results straight into the table. If it
-isn't installed, nothing is searched — the tool just prints the exact
-command for you to run yourself later:
-```
-cas-offinder results.tsv.offinder_in.txt C <cas_offinder_out>
-```
-Once you have that output file (from this run, or generated separately —
-possibly on a different, more capable machine), bring the scores in without
-repeating the search:
+
+### The Same Run, Leaning On The Default
+
+Every flag above whose value is already the default can simply be dropped. For
+the HIV-1 case that leaves four, because four thing have no sensible default:
+the reference, its annotation, which of the two LTR copy to pin to, and the two
+stage that are off unless asked for.
+
 ```bash
-python gRNADesign.py my_panel.fasta results.tsv --offinder-results cas_offinder_out.txt
+python gRNADesign.py input/hiv-db_gap_squeeze.fasta \
+    --reference input/K03455.gb \
+    --annotation input/HXB2.gff3 \
+    --reference-region 1 634 \
+    --mfe --plot
 ```
 
-If neither flag is given, the whole off-target stage is skipped and
-`Offtarget_Count` / `Offtarget_Repeat_Flag` are simply left blank — this is
-the default, and is intentional; there's no reason to require a multi-
-gigabyte human genome file just to look at the on-target conservation table.
+This writes the same `output/gRNA_table.tsv` and `output/gRNA_map.png`. The
+PAM `NGG` 3' of a 20 nt spacer, the 0.10 and 0.80 gate, the 20 bp entropy
+window and the cache at `data/mfe_cache.json` all come from `config.py`.
 
-All of these same defaults live in one place, `config.py`, if you'd rather
-change them permanently than type flags every run.
+Two cosmetic thing differ from the longer command, both because their flag is
+off by default: the CFD panel has no dashed guide line, and no
+`consensus.fasta` is written. Add `--cfd-line 0.8` or `--consensus` to get
+them back.
 
-## 4. Output columns, and the math behind each one
+**On the first run** the fold cache is empty, so `--mfe` submits one job per
+distinct guide to the public RNAfold server and the step is the slow part of
+the run:
 
-### 4.1 The table itself
+```
+Bonus  Fold each guide for its minimum free energy
+  31 distinct guide, 0 cached, 31 to fold via server
+  folded 10/31
+  folded 20/31
+  folded 30/31
+  folded 31/31
+```
+
+That is the whole cost of the run: 31 guide took about two minute against the
+public server, while every other step together took under a second. Every later
+run reads `data/mfe_cache.json` instead and the step is instant:
+
+```
+  31 distinct guide, 31 cached, 0 to fold via server
+```
+
+Without `--mfe` the whole run takes well under a second, and the `MFE` and
+`Fold_Structure` column are left empty. With a local ViennaRNA install there is
+no server and no wait at all.
+
+
+## 5. Input
+
+### The Alignment
+
+**The panel must already be aligned.** This tool does not align for you. Run
+MAFFT, MUSCLE, Clustal or whatever your field uses first, and feed in the
+result.
+
+That is not a formality. Every number here is computed **down a column**: the
+entropy of column $j$, the gap fraction of column $j$, the consensus base at
+column $j$. That only means anything if column $j$ holds the same position in
+every sequence. Alignment is what makes a column a position rather than an
+index.
+
+What happens if you feed in something unaligned:
+
+- **Row of different length** → refused outright, naming the length it saw.
+  This catches an ordinary unaligned FASTA, since real sequence rarely comes
+  out exactly the same length.
+- **Row of the same length that are not actually aligned** (for example every
+  sequence trimmed to 600 nt) → this passes the length check, so the run
+  **warns** instead:
+
+  ```
+  WARNING: mean column entropy is 0.41 and there is essentially no gap.
+  That combination usually means the input is not actually aligned, only
+  equal in length.
+  ```
+
+  The signature is high per column entropy together with no gap at all. A real
+  alignment of related sequence either carries gap from the indel it absorbed,
+  or is conserved enough to have low entropy. Carrying neither is the mark of
+  sequence that were never aligned. It is a warning and not an error, because
+  a genuinely very diverse panel can look the same; check the panel rather than
+  the message.
+
+Gap is expected and handled. An IUPAC ambiguity code is skipped rather than
+guessed at: it shrinks the sample at that column instead of being counted as a
+base it might not be.
+
+**How the alignment was trimmed does not matter.** Anchoring is by sequence
+content, not by column index, so a gap stripped, gap squeezed or sub-region
+alignment all work and all report the same coordinate. See
+[section 7.3](#73-step-3-anchor-the-panel-to-the-reference).
+
+### The Reference
+
+Optional. It supplies **coordinate and annotation only**; every score is
+computed from the panel. Without `--reference` the run still produces a full
+table, with `Ref_Start`, `Ref_End`, `Gene` and `Element` left empty, and
+`--plot` is skipped because the map is drawn against reference coordinate.
+
+### Which Annotation Format Work
+
+The tool needs a reference **sequence** and **feature** with coordinate on it.
+They can come from one file or two.
+
+| You have | Pass | Note |
+| --- | --- | --- |
+| GenBank (`.gb`, `.gbk`, `.gbff`, `.genbank`) | `--reference` | Sequence and annotation in one file. Simplest case |
+| FASTA + GFF3 (`.gff`, `.gff3`) | `--reference` + `--annotation` | The usual pairing from Ensembl, NCBI or a browser |
+| FASTA + GTF (`.gtf`) | `--reference` + `--annotation` | Read as GFF3 with GTF style attribute |
+| FASTA + BED (`.bed`) | `--reference` + `--annotation` | Minimal: every feature becomes a gene |
+| FASTA alone | `--reference` | Coordinate reported, `Gene` and `Element` empty |
+
+`--annotation` **replaces** whatever annotation the reference carried rather
+than adding to it, so that giving a GenBank file and its own GFF3 export does
+not duplicate every feature.
+
+Things worth knowing before you hit them:
+
+- **Coordinate convention is handled.** GFF3 and GTF are 1 based inclusive,
+  BED is 0 based half open; both land on the same internal span, and there is
+  a test for exactly this.
+- **The sequence name need not match.** If no feature matches the reference
+  name, the file is read as being about that one sequence rather than silently
+  coming back empty.
+- **Only the first record of the reference is read.** Give a single sequence
+  reference, or split it first.
+- **BED carries no feature type**, so every BED feature becomes a gene and
+  nothing reaches `Element`. Use GFF3 if you want the regulatory element split
+  out.
+- **A compound location is split into its part**, so a guide in an intron is
+  not reported as hitting the gene.
+- **Feature naming** comes from `Name`, then `gene`, `gene_name`, `product`,
+  `locus_tag`, `ID`, `note`. First one present wins.
+- **`feature_alias`** in `config.py` substitutes display name for a record
+  whose feature name are archaic or terse. It never moves a coordinate.
+
+
+## 6. Output
+
+### The Table
+
+One TSV row per surviving candidate.
 
 | Column | Meaning |
-|---|---|
-| `gRNA_5to3` | The guide, written as `SPACER(PAM)` — e.g. `GACAAGATATCCTTGATCTG(TGG)`. The 20 letters before the parenthesis are the actual guide sequence (write it as RNA — U instead of T — to synthesize it); the 3 letters in parentheses are the adjacent PAM, shown for context only, not part of the guide itself. |
-| `Start_Pos` | The smallest plus-strand alignment column touched by this guide's 23-column footprint (spacer+PAM together) — one shared ruler for both strands. Section 6 works through exactly what this points at for `+` vs `-` guides. |
-| `Derived_Strand` | `+` if the spacer was read directly off the plus strand; `-` if found by reverse-complementing first. This describes *how the guide was found*, not which physical strand the guide RNA binds — see section 6. |
-| `PAM_Conservation` | Fraction of the 365 panel variants that actually carry `GG` at this window's PAM. Always ≥ `p_pam_min` by construction. |
-| `Weighted_Entropy` | How conserved the spacer is, weighted so that variation near the PAM (where Cas9 is least forgiving) counts more than variation at the far end. **Lower = more conserved where it matters.** Range $[0,1]$. |
-| `CFD_Score_Independent` | Predicted cutting activity against the panel, assuming the 20 spacer positions vary independently of each other. Range $[0,1]$; $1.0$ = perfect predicted activity everywhere. |
-| `CFD_Score_Exact` | The same idea, computed exactly instead of assuming independence — the real CFD formula run against each of the 365 variants' actual sequence, then averaged. A big gap from `CFD_Score_Independent` means certain mismatches travel together across variants rather than occurring independently (a sub-lineage signal). |
-| `Offtarget_Count` | Number of human-genome hits scoring above the CFD off-target threshold (default $0.2$). Blank unless off-target scoring ran. |
-| `Offtarget_Repeat_Flag` | `True` if this guide has an unusually large number of total genomic matches (default: more than 50), usually meaning it also matches a repetitive element. Blank unless off-target scoring ran. |
+| --- | --- |
+| `gRNA5to3` | `SPACER(PAM)`, read 5' to 3' in the guide's own frame |
+| `Derived_Strand` | `+` or `-`; the strand the protospacer is read off |
+| `Entropy_Mean` | Mean Shannon entropy over the spacer column |
+| `PAM_Conservation` | Fraction of the panel carrying that exact PAM |
+| `CFD_Score` | Mean CFD of the guide against every sequence in the panel |
+| `MFE` | Minimum free energy of the folded guide, kcal/mol |
+| `Fold_Structure` | That fold in dot bracket notation |
+| `Gene` | Gene product hit, or the enclosing region when there is none |
+| `Element` | Narrower feature hit, narrowest first |
+| `Ref_Start`, `Ref_End` | Protospacer span on the reference, 1 based inclusive |
+| `Align_Start`, `Align_End` | The same span as alignment column, for tracing a row back to the panel |
 
-Nothing is pre-sorted — in general you want low `Weighted_Entropy`, high
-`CFD_Score_Exact`, and (once available) low `Offtarget_Count`.
+#### What To Order
 
-### 4.2 Notation used below
+`gRNA5to3` reads `GACAAGATATCCTTGATCTG(TGG)`. **Order the 20 nt outside the
+bracket.** The bracketed PAM is not part of the guide: it is the motif that has
+to be present in the target DNA, immediately 3' of the protospacer. It is shown
+because a guide is meaningless without knowing its PAM is there, and bracketed
+so it can never be pasted into an order by mistake.
 
-| Symbol | Meaning |
-|---|---|
-| $L$ | Alignment length: $866$ columns. |
-| $N$ | Number of panel variants: $365$. |
-| $i = 1, \dots, 20$ | Spacer position. $i=1$ is the PAM-distal end (the guide's 5′ end); $i=20$ is PAM-proximal (the "seed", right next to the PAM, empirically the least mismatch-tolerant region). |
-| $g_i$ | The guide's own (consensus) base at position $i$. |
-| $\text{freq}_i(b)$ | Fraction of the $N$ panel variants with base $b \in \{A,C,G,T\}$ at position $i$'s alignment column (ambiguity codes excluded from the denominator). |
-| $H_i$ | Shannon entropy of the alignment column at position $i$ (over all 5 symbols $\{A,C,G,T,-\}$). |
-| $w_i$ | The CFD-derived weight for position $i$ (higher = a mismatch here hurts cutting more). |
-| $\text{act}(i,x,y)$ | CFD single-mismatch activity: fraction of cutting activity that survives if the guide expects base $x$ at position $i$ but the target actually has $y$ there. $\text{act}(i,x,x) = 1$. |
+Both parts are written 5' to 3' in the guide's own frame, so a minus strand
+guide reads just as directly as a plus strand one. The sequence shown is always
+the sequence to synthesise, whatever `Derived_Strand` says.
 
-### 4.3 The equations
+#### How To Read The Coordinate
 
-**Per-column Shannon entropy** (`columns.entropy`) — using log base 5 means
-it's already scaled to $[0,1]$ without a separate normalization step, and
-treating gap `-` as a 5th symbol means an all-gap column reads the same as
-an all-agreeing column (both "not variable"):
+All four coordinate are **plus strand of the reference**, and **`Start` is
+always the smaller number**, on both strand. `Ref_*` and `Align_*` describe the
+same 20 nt protospacer, one in reference coordinate and one in alignment
+column, so they can be compared directly.
 
-$$
-H_i = -\sum_{s \in \{A,C,G,T,-\}} p_i(s)\, \log_5 p_i(s), \qquad 0 \log_5 0 := 0
-$$
+Start is deliberately *not* the 5' end of the guide. Every genomic format
+(GFF3, BED, GenBank, SAM, VCF) reports `start ≤ end` with orientation carried
+by a separate strand field, and following that convention is what lets the
+output go straight into bedtools, IGV or a genome browser without being
+rewritten. Reversing the coordinate on minus strand row would break all of
+them.
 
-**Position weights** (`cfd.cfd_position_weights`) — averaged over all 12
-possible ordered mismatch pairs among $\{A,C,G,T\}$, then flipped so a
-position where mismatches hurt *more* gets a *higher* weight. This is
-computed once from the CFD table itself, not hand-tuned:
+To get the 5' end of the guide itself, read `Derived_Strand`:
 
-$$
-w_i = 1 - \frac{1}{12}\sum_{\substack{x,y \in \{A,C,G,T\}\\ x \neq y}} \text{act}(i,x,y)
-$$
+| `Derived_Strand` | 5' end of the guide | 3' end, next to the PAM |
+| --- | --- | --- |
+| `+` | `Ref_Start` | `Ref_End` |
+| `-` | `Ref_End` | `Ref_Start` |
 
-**`Weighted_Entropy`** (`score.weighted_entropy`) — the seed-weighted mean
-of the 20 spacer columns' entropy:
+### Reading The Number
 
-$$
-\text{Weighted\_Entropy} = \frac{\displaystyle\sum_{i=1}^{20} w_i H_i}{\displaystyle\sum_{i=1}^{20} w_i}
-$$
+| Column | Range | Lowest means | Highest means | Want |
+| --- | --- | --- | --- | --- |
+| `Entropy_Mean` | 0 to 1 | **0**: every sequence identical across all 20 nt | **1**: all five symbol equally likely at every position | **low** |
+| `PAM_Conservation` | 0 to 1 | **0**: not one sequence carries the consensus PAM exactly | **1**: every sequence carries it | **high** |
+| `CFD_Score` | 0 to 1 | **0**: the guide cuts nothing in the panel | **1**: cuts every sequence at full efficiency | **high** |
+| `MFE` | ≤ 0 | strongly negative, about −8 or below for a 20 mer: folds hard on itself | **0**: no base pair at all, the spacer is free | **near 0** |
 
-**`CFD_Score_Independent`** (`score.expected_cfd`, first return value) — the
-expected activity at each position on its own, multiplied across all 20 as
-if they varied independently:
+Two caveats about the extremes.
 
-$$
-a_i = \sum_{b \in \{A,C,G,T\}} \text{freq}_i(b)\cdot \text{act}(i, g_i, b), \qquad \text{act}(i, g_i, {-}) := 0
-$$
+`Entropy_Mean` is on a log base 5 scale over `{A, C, G, T, -}`, so 1 is the
+entropy of a column where all five symbol are equally likely. A real alignment
+rarely passes about 0.5. Compare candidate to each other, not to the
+theoretical 1.
 
-$$
-\text{CFD\_Score\_Independent} = \prod_{i=1}^{20} a_i
-$$
+`CFD_Score` is a mean over the whole panel **including** the sequence the guide
+fails on, so 0.90 does not mean "90% efficient". It means closer to "the
+average sequence in this panel is cut at 90% of the efficiency of a perfect
+match". One sequence with a broken PAM contributes a hard 0 and pulls the mean
+down, which is intended.
 
-**`CFD_Score_Exact`** (`score.expected_cfd`, second return value) — skip the
-independence assumption; average the real CFD score against each variant's
-actual window sequence:
+### The Plot
 
-$$
-\text{CFD\_Score\_Exact} = \frac{1}{N}\sum_{v=1}^{N} \text{CFD}(g, s_v, p_v)
-$$
+`--plot` draws one figure, four panel sharing the reference coordinate:
 
-where $s_v, p_v$ are variant $v$'s actual spacer and PAM bases in this
-window (a variant contributes $0$ if it has a gap/ambiguity anywhere in the
-window, or a PAM that isn't in the PAM table).
+1. **CFD score** per candidate as a stem. Height is the score, marker area is
+   the MFE, colour is the strand.
+2. **Shannon entropy** as a running window mean line: the conservation
+   landscape. A dip is a conserved stretch.
+3. **Reference annotation**. A broad feature is a labelled bar, broadest at the
+   bottom; a short element is a tick with a leader up to its label.
+4. **Guide footprint** as an arrow pointing 5' to 3' along the strand the
+   protospacer is read from. Plus strand above the rule, minus below. Each
+   strand is packed into as many sub lane as it takes for no two arrow to
+   touch, so a cluster of guide a base apart stays countable.
 
-**The atomic CFD score** (`cfd.calc_cfd`) — the real Doench 2016 / CRISPOR
-formula everything above is built on. $wt$ is the guide's intended 20-mer,
-$sg$ is whatever it's being compared against (a variant, or a genomic
-off-target hit), $pam$ is the 2-letter key for the PAM actually found
-(section 7 has the full table), and $\overline{sg_i}$ denotes the
-Watson–Crick complement of $sg_i$:
+The strand colour is shared between panel 1 and panel 4, so a stem can be read
+straight down onto its own arrow.
 
-$$
-\text{CFD}(wt, sg, pam) = \text{pam\_score}(pam) \cdot \prod_{i\,:\, wt_i \neq sg_i} \text{mismatch\_score}\big(wt_i, \overline{sg_i}, i\big)
-$$
+Design follows the Swiss International Typographic manner: one grid, flush left
+text, a single sans serif in two weight, hairline rule, ink and paper with two
+muted accent. Every mark carries data. There is no threshold line on the CFD
+panel by default, because the y axis already states the score; pass
+`--cfd-line 0.8` if you want one drawn.
 
-If $wt = sg$ exactly, the product is empty (equal to 1), so
-$\text{CFD}(wt, wt, pam) = \text{pam\_score}(pam)$ — this identity is
-exactly what the CFD validation test checks (section 9). $\text{act}(i,x,y)$
-above is just this same formula evaluated on two 20-mers identical
-everywhere except position $i$, with $pam$ fixed to `'GG'` and the result
-divided back out by $\text{pam\_score}(\text{'GG'})$ to isolate the pure
-per-position mismatch effect from the PAM term.
 
-## 5. Why the guide is shown as `SPACER(PAM)`
+## 7. Data Process
 
-`gRNA_5to3` shows the PAM in parentheses purely so it's visible at a glance,
-without having to look up `Start_Pos` and count 20 characters over — e.g.
-`GACAAGATATCCTTGATCTG(TGG)` immediately tells you the PAM here is `TGG`
-(the consensus; individual variants may differ slightly, which is exactly
-what `PAM_Conservation` quantifies). It's a display-only convenience: off-
-target search and CFD scoring both use the bare 20-nt spacer internally, and
-the parenthesized PAM is never treated as part of the guide RNA sequence
+Notation. The alignment has $N$ sequence and $L$ column. $x_{k,j}$ is the
+symbol of sequence $k$ at column $j$. The alphabet counted is
+
+$$\Sigma = \lbrace \mathtt{A}, \mathtt{C}, \mathtt{G}, \mathtt{T}, \mathtt{-} \rbrace .$$
+
+### 7.1 Step 1: Read The Alignment
+
+The panel is read into an $N \times L$ matrix of byte, which makes every step
+below a vector operation rather than a loop over sequence. Unequal row length
+is an error, not a warning: a ragged "alignment" silently destroys every column
+statistic that follows.
+
+The minus strand is handled by reverse complementing the whole matrix once and
+running the identical search on it, so nothing downstream ever reads a row
+backward. Complementing is IUPAC aware: gap maps to gap, and an ambiguity code
+maps to its complementary code ($\mathtt{R} \leftrightarrow \mathtt{Y}$,
+$\mathtt{K} \leftrightarrow \mathtt{M}$, $\mathtt{N} \leftrightarrow \mathtt{N}$).
+
+### 7.2 Step 2: Column Statistic
+
+For each column $j$, count every symbol of $\Sigma$ and normalise:
+
+$$p_{j,s} = \frac{n_{j,s}}{\sum_{s' \in \Sigma} n_{j,s'}}, \qquad s \in \Sigma .$$
+
+A symbol outside $\Sigma$ matches no counter, so an ambiguity code never enters
+the denominator.
+
+**Gap fraction** is the gap component, $g_j = p_{j,\mathtt{-}}$.
+
+**Consensus** is the majority base, ignoring gap and ambiguity, with a tie
+broken toward A, C, G, T order so a rerun gives the same answer:
+
+$$c_j = \arg\max_{b \in \lbrace \mathtt{A}, \mathtt{C}, \mathtt{G}, \mathtt{T} \rbrace} p_{j,b} .$$
+
+**Shannon entropy** over all five symbol, in base 5:
+
+$$H_j = -\sum_{s \in \Sigma} p_{j,s} \log_5 p_{j,s}, \qquad 0 \log 0 := 0 .$$
+
+Base 5 is not cosmetic. A column with all five symbol equally likely has
+entropy exactly 1 and a pure column exactly 0, so $H_j \in [0,1]$ by
+construction and is never renormalised later. Counting the gap as a symbol is
+also deliberate: a column that is half gap is genuinely unreliable to target,
+and that should show up as entropy rather than be hidden.
+
+Entropy is strand symmetric. Complementing permutes the symbol and reversing
+permutes the column, and neither changes a sum over the whole alphabet, so $H$
+is computed once on the plus strand and reused for a minus strand hit.
+
+### 7.3 Step 3: Anchor The Panel To The Reference
+
+This is the step most likely to be silently wrong, so it is worth
+understanding.
+
+**The problem.** An alignment is a pile of sequence in its own coordinate
+system. Column 1 of your panel is column 1 of your panel; it is not base 1 of
+anything. Nothing inside a FASTA records which part of which genome it came
+from, or even which strand it is on. So no correspondence is assumed. One is
+derived, once, and printed.
+
+**How.** Only a **core column**, one with $g_j \le$ `--core-gap-fraction`
+(0.5), may anchor, since a column that is mostly gap carries no reliable base.
+The consensus letter of the core column are concatenated into one string and
+**locally** aligned to the reference, with an affine gap penalty:
+
+$$s_{\text{match}} = +1, \quad s_{\text{mismatch}} = -1, \quad s_{\text{open}} = -10, \quad s_{\text{extend}} = -0.5 .$$
+
+Local, not global, because the panel usually covers only part of the reference.
+The alignment yields
+
+$$m : \lbrace 0, \dots, L-1 \rbrace \to \lbrace 0, \dots, R-1 \rbrace \cup \lbrace -1 \rbrace,$$
+
+mapping each column to a reference position, or to $-1$ when it anchors
+nothing.
+
+**Worked micro example.** Four row, eight column:
+
+```
+column          1  2  3  4  5  6  7  8
+row 1           A  C  -  G  T  A  C  G
+row 2           A  C  -  G  T  A  C  G
+row 3           A  T  -  G  T  A  -  G
+row 4           A  C  -  G  T  A  C  G
+gap fraction   .0 .0 1.0 .0 .0 .0 .25 .0
+consensus       A  C  (-) G  T  A  C  G
+core column     *  *      *  *  *  *  *
+```
+
+Column 3 is all gap, so it is not a core column and cannot anchor. The query
+built from the core column is `ACGTACG`. Suppose that aligns to reference
+positions 101–107. Then:
+
+```
+column    1    2    3    4    5    6    7    8
+maps to  101  102   -   103  104  105  106  107
+```
+
+Column 3 reports no coordinate; everything else does. A guide sitting on
+columns 4–8 is reported as reference 103–107.
+
+**Why the trimming of your alignment does not matter.** Anchoring is driven by
+sequence content, never by column index. So:
+
+- A **gap squeezed** alignment (LANL's Gap Strip/Squeeze, or any tool that
+  drops mostly gap columns) is shorter and has *fewer* unanchored column, so it
+  anchors more cleanly, not less. The coordinate it reports are the same.
+- An alignment with a long **insertion** relative to the reference anchors
+  everywhere except the inserted column, which report no coordinate.
+- An alignment of a **sub-region** is found by the local alignment wherever it
+  sits in the reference.
+- A **differently gapped** alignment of the same sequence gives the same
+  reference coordinate, because the gap column were never the thing being
+  matched.
+
+**What is printed, every run:**
+
+```
+anchored to K03455.1 1-634 (634/866 column anchored, score 590 over 634
+core base, 0.93 per base)
+```
+
+Read that line. It names the reference span matched, how many column found a
+home, and the per base match rate.
+
+**The four way it can go wrong.**
+
+1. **The panel is reverse complemented.** Nothing in a FASTA says which strand
+   it holds. Both orientation are scored against a short probe before anything
+   else, and the whole panel is flipped if the reverse wins, so a flipped panel
+   gives byte for byte the same table as a forward one.
+2. **The target is repeated.** A local alignment cannot choose between two
+   identical copy, so the coordinate can land on the wrong one with a perfectly
+   healthy score. `--reference-region START END` removes the choice. Any
+   repeated element, gene family or segmental duplication has this problem.
+   See "What `--reference-region` Is For" just below.
+3. **The panel covers only part of the reference.** Normal, expected and
+   handled. This is the whole reason the alignment is local rather than global.
+   A 511 nt panel inside a 9719 nt genome anchors exactly, and the anchored
+   span tells you where. You do **not** need any flag for this.
+4. **The panel and the reference are not the same locus.** Then little anchors,
+   and the run warns when under half the column do.
+
+#### What `--reference-region` Is For
+
+It **restricts** the search. It does not define it.
+
+- **Omit it** and the whole reference is searched. That is the normal case,
+  including when your panel covers only a small part of the reference. You do
+  not need the flag to "select" a sub-region of the genome; the local alignment
+  finds your panel wherever it sits.
+- **Give it** only when the panel matches more than one place and you must say
+  which. That is the repeat case.
+
+`START` and `END` are 1 based with **both end included**, so `1 634` is 634
+base, and the reported coordinate stays in **full reference space** regardless.
+Pinning to `9086 9719` reports a hit there as 9100, not as 15.
+
+For HIV-1 the flag is needed because the LTR is in HXB2 twice, at 1–634 (the
+5' LTR, which is where `1 634` comes from) and at 9086–9719 (the 3' LTR), and
+the two are near identical. Without the flag:
+
+```
+anchored to K03455.1 9086-9719   # the 3' copy, score 592
+```
+
+With `--reference-region 1 634`:
+
+```
+anchored to K03455.1 1-634       # the 5' copy, score 590
+```
+
+592 against 590. The margin is two points out of 634, so which copy wins is
+effectively arbitrary, and the reported coordinate differ by about 9 kb. That
+is exactly the situation the flag exists for.
+
+By contrast, a panel of a **unique** locus needs nothing. A 511 nt panel taken
+from *gag* anchors on its own:
+
+```
+anchored to K03455.1 790-1300 (511/511 column anchored, 1.00 per base)
+```
+
+### 7.4 Step 4: Window Enumeration And Gate
+
+Let the spacer be $\ell$ nt and the PAM motif $M$ be $m$ nt, giving a window of
+$\ell + m$. For a 3' PAM the window is spacer then PAM; for a 5' PAM it is PAM
+then spacer. Every start position on both strand is tested against three gate.
+
+**Gate 1, gap.** Every column of the window must be clean enough:
+
+$$\max_{j \in \text{window}} g_j \le g_{\max} .$$
+
+**Gate 2, consensus PAM.** The consensus must itself present a usable PAM,
+written $c_{\text{PAM}} \models M$ for "satisfies the motif at every position".
+
+**Gate 3, PAM presence.** The site must be cuttable across the panel, not only
+in the consensus:
+
+$$f_{\text{PAM}} = \frac{1}{N} \left| \lbrace k : x_{k,\text{PAM}} \models M \rbrace \right| \ge p_{\min} .$$
+
+Gate 3 is a **motif** match, not an exact match: a variant reading `TGG` where
+the consensus reads `AGG` is still cut by SpCas9, so it counts as present.
+That is a different question from the one `PAM_Conservation` answers, which is
+why both exist.
+
+### 7.5 Step 5: Metric
+
+#### Shannon Entropy Mean
+
+A plain, unweighted mean over the spacer column:
+
+$$\bar{H} = \frac{1}{\ell} \sum_{j \in \text{spacer}} H_j \in [0, 1] .$$
+
+Unweighted on purpose: position dependent weighting is what CFD already does,
+with a published and validated weight, so doing it twice would double count the
+seed region and make the two column correlate by construction.
+
+#### PAM Conservation
+
+The fraction of the panel carrying the **exact** consensus PAM:
+
+$$C_{\text{PAM}} = \frac{1}{N} \left| \lbrace k : x_{k,\text{PAM}} = c_{\text{PAM}} \rbrace \right| .$$
+
+Since an exact match implies a motif match, $C_{\text{PAM}} \le f_{\text{PAM}}$
+always. A large gap between the two says the PAM is present but its identity is
+drifting, which matters wherever PAM identity affects efficiency.
+
+#### CFD Score
+
+The Cutting Frequency Determination model of Doench et al. 2016, as used by
+CRISPOR. For the consensus guide $g$ against one variant $v^k$:
+
+$$\mathrm{CFD}(g, v^k) = P(\pi^k) \prod_{i=1}^{\ell} a_i(g_i, v^k_i) ,$$
+
+where $a_i$ is the activity retained by a mismatch at spacer position $i$,
+
+$$a_i(x, y) = \begin{cases}
+1 & x = y \\
+0 & y \in \lbrace \mathtt{-} \rbrace \cup \text{ambiguity} \\
+T\left[\, \mathtt{r}x : \mathtt{d}\bar{y},\, i \,\right] & \text{otherwise,}
+\end{cases}$$
+
+with $T$ the published mismatch table and $\bar{y}$ the complement of $y$. A
+gap scores 0 rather than being looked up, because an indel shifts the guide out
+of frame and the table has no notion of an indel.
+
+$P$ is the PAM factor. For SpCas9 `NGG` it is the published PAM table on the
+two 3' base; any other motif falls back to a presence test, because the CFD PAM
+table is SpCas9 specific:
+
+$$P(\pi) = \begin{cases}
+T_{\text{PAM}}[\pi_{2:3}] & M = \mathtt{NGG} \\
+\mathbb{1}[\pi \models M] & \text{otherwise.}
+\end{cases}$$
+
+The reported score is the mean over the whole panel:
+
+$$\overline{\mathrm{CFD}} = \frac{1}{N} \sum_{k=1}^{N} \mathrm{CFD}(g, v^k) \in [0, 1] .$$
+
+The denominator is the full $N$. A variant with a gap in the protospacer or a
+broken PAM contributes 0 and still counts, so it pulls the mean down rather
+than quietly disappearing from the average.
+
+Because the published table is indexed over position 1 to 20 of an SpCas9
+spacer, CFD is only defined for $\ell = 20$. At any other spacer length the
+column is left empty and the run says so, rather than extrapolating.
+
+### 7.6 Step 6: Fold
+
+Each **distinct** guide is folded as RNA and its minimum free energy reported
+with the structure in dot bracket notation. Folding uses a local ViennaRNA
+install when one is importable and the public RNAfold web server otherwise, at
+`--mfe-temperature` with the Turner 2004 parameter. By default the bare spacer
+is folded; `--scaffold` appends the constant region so the whole sgRNA is
+folded instead.
+
+**One sequence per job.** The RNAfold server silently concatenates a multi
+record FASTA into a single sequence and returns one quietly wrong answer, so
+one job is submitted per distinct guide and nothing is ever batched.
+
+**The cache.** Result are stored in `data/mfe_cache.json` (`--mfe-cache`), a
+flat JSON object:
+
+```json
+{"AAGCACCATCCAAAGGTCAG||37": ["....(((.......)))...", -1.1]}
+```
+
+The key is `sequence|scaffold|temperature`, so changing the scaffold or the
+temperature is a different key and refolds, while a rerun at the same setting
+costs nothing and never touches the network. Two guide with the same spacer
+fold once. Delete the file to force a full refold.
+
+### 7.7 Step 7: Annotate
+
+The protospacer column are mapped back through $m$ from step 3, and the span is
+reported 1 based inclusive:
+
+$$\text{Ref\_Start} = \min_{j \in \text{spacer},\, m(j) \ge 0} m(j) + 1, \qquad
+\text{Ref\_End} = \max_{j \in \text{spacer},\, m(j) \ge 0} m(j) + 1 .$$
+
+Every annotated feature overlapping that span is collected, sorted narrowest
+first, and split in two:
+
+- **`Gene`** is the overlapping gene product (`CDS`, `gene`, `mat_peptide`).
+  With no coding feature there it falls back to the single broadest overlapping
+  feature, so a guide in a non coding element still reports where it sits.
+- **`Element`** is everything else that overlaps, narrowest first. This is the
+  column that names the regulatory part being targeted.
+
+Structural bookkeeping (`source`, `mRNA`, `prim_transcript`, `exon`, `intron`)
+is skipped, because "this guide is inside the genomic mRNA" is true of almost
+everything and says nothing useful.
+
+
+## 8. Coordinate & Strand
+
+Two frame are kept deliberately separate, and confusing them is the easiest way
+to order the wrong oligo.
+
+The **search frame** is whichever matrix the window was found in: the plus
+matrix, or the reverse complemented matrix for a minus strand hit. Scoring
+reads this frame, because the guide must be read 5' to 3' for the CFD position
+index to mean anything.
+
+The **report frame** is always the plus strand of the reference. Reverse
+complemented column $j$ is plus column $L - 1 - j$, so a minus strand window
+carries both index set and every coordinate in the table is plus frame.
+
+`Derived_Strand` is a "read off" label, never a "binds to" label. `+` means the
+protospacer and its PAM are read off the plus strand, so the guide RNA you
+synthesise has the sequence printed in `gRNA5to3`, and the RNA itself pairs with
+the minus strand. **The `gRNA5to3` column is always the sequence to order**, minus
+the bracketed PAM, whatever the strand says.
+
+
+## 9. File Map
+
+| File | Job |
+| --- | --- |
+| `gRNADesign.py` | Command line entry; orchestrates the pipeline and owns the run log |
+| `config.py` | Every default, in one place. The only file to edit to change behaviour |
+| `alignment.py` | FASTA input, the byte matrix, reverse complement, column frequency, consensus, entropy, running mean |
+| `pam.py` | IUPAC motif matching, window enumeration, the three gate, PAM conservation |
+| `cfd.py` | The published CFD mismatch and PAM table, the score, and the vectorised activity lookup |
+| `score.py` | The per candidate metric: entropy mean and mean CFD |
+| `annotation.py` | Reference reader (GenBank, GFF3, GTF, BED), orientation detection, the column to coordinate map, the gene and element lookup |
+| `mfe.py` | Folding: local ViennaRNA or the RNAfold server, with the on disk cache |
+| `report.py` | Column name, rounding, sorting, and writing the TSV |
+| `plot.py` | The candidate map |
+
+| Folder | Holds |
+| --- | --- |
+| `data/` | The CFD mismatch and PAM table, and the fold cache. The only data shipped |
+| `input/` | Your sequence, reference and annotation. Not tracked by git |
+| `output/` | Regenerated by every run. Not tracked by git |
+| `tool/` | Optional helper, not part of the pipeline |
+| `test/` | The test suite |
+
+
+## 10. Test
+
+```bash
+python -m unittest discover -s test -t .
+```
+
+58 test, well under a second, no network touched and no outside data needed:
+the end to end test builds its own synthetic panel and reference, so it runs on
+a fresh clone.
+
+**`test/test_core.py`** — the maths.
+
+- *Reverse complement* is its own inverse, maps gap to gap, and maps an IUPAC
+  code to its complementary code.
+- *Entropy* is 1 for a five symbol uniform column and 0 for a pure column,
+  which pins the log base; an ambiguity code shrinks the denominator; entropy
+  is strand symmetric, which is what licenses computing it once.
+- *The gate* each reject and pass on a toy alignment built to sit either side
+  of the threshold, and `PAM_Conservation` counts exact consensus match while
+  the gate counts motif match.
+- *CFD* reproduces the PAM score on a perfect match, scores a gap and a broken
+  PAM as 0, and the lookup table agrees with the scalar function everywhere.
+- *The index direction guard.* Position 20 is PAM proximal, so the seed must
+  come out as the **harshest** end. If the CFD table were indexed backward the
+  seed would look like the most tolerant end, and every score in the project
+  would be quietly wrong while still looking reasonable. This is the single
+  most valuable test here.
+
+**`test/test_annotation.py`** — the coordinate.
+
+- GFF3 is 1 based inclusive and BED is 0 based half open; both must land on the
+  same internal span.
+- An alias renames without moving a coordinate.
+- A gapped panel maps onto the reference with the fully gapped column anchoring
+  nothing and the rest strictly increasing.
+- `Element` is ordered narrowest first.
+- Orientation is detected both way on a non palindromic sequence.
+- A duplicated region is reachable by either copy through `--reference-region`,
+  and a coordinate stays in full reference space.
+
+**`test/test_integration.py`** — the whole pipeline on a synthetic panel:
+every guide a clean 20 mer, every PAM matching the motif, every score in range,
+the table round tripping, two run identical, a reverse complemented panel
+giving the same answer, and a run without a reference still scoring everything.
+It also parses real RNAfold output text without the network, and checks the
+cache key behaviour.
+
+**`test/synthetic.py`** — builds the panel, reference and annotation the
+integration test uses.
+
+
+## 11. Targeting the HIV-1 Provirus
+
+The tool is general, but it was built for one job: finding a guide that cut the
+integrated HIV-1 provirus across the diversity of circulating strain. This
+section is a complete worked example and the source of the default in the
+command of [section 4](#a-complete-example).
+
+The LTR is the target worth attacking. It sits at both end of the provirus, so
+one guide cut twice, and it holds the promoter the virus needs to transcribe
 itself.
 
-## 6. Coordinate system — what `Start_Pos` actually points at
-
-Both strands are reported on **one shared ruler**: `Start_Pos` is always the
-*smallest* plus-strand alignment column touched by the guide's full
-23-column footprint (spacer + PAM together). This is what makes `+` and `-`
-guides directly comparable and sortable by position — but it means
-`Start_Pos` points at a *different part of the guide* depending on strand,
-which is easiest to see with real numbers from the table.
-
-**`+` strand example** — `GACAAGATATCCTTGATCTG(TGG)`, `Start_Pos = 69`: this
-guide was read directly off the plus strand, so its own 5′ end (the first
-spacer letter) sits at plus-column 69, and reading left-to-right from there
-gives you the spacer, then the PAM, in the same order the guide itself
-reads. `Start_Pos` = the guide's own starting point. This is the intuitive
-case.
-
-**`-` strand example** — `CTTTATTGAGGCTTAAGCAG(TGG)`, `Start_Pos = 719`:
-this guide was *derived* by reverse-complementing the whole alignment and
-running the identical search on the mirrored copy. Mapped back onto the
-plus strand, its 23-column footprint spans plus-columns 719–741 — but
-because this guide's own 5′→3′ direction runs *right-to-left* along the
-plus-strand ruler, its 5′ end is actually at the **right** edge
-(plus-column 741), and its PAM sits at the **left** edge (plus-columns
-719–721). So for this row, `Start_Pos` (719) marks the *last base of the
-PAM*, not the start of the spacer:
-
-| Part of the guide | Its own column (mirrored-alignment frame) | Mapped plus-strand column |
-|---|---|---|
-| Spacer, 1st base (guide's 5′ end) | 124 | 741 |
-| Spacer, 20th base (last base before the PAM) | 143 | 722 |
-| PAM, 1st base ("N") | 144 | 721 |
-| PAM, 3rd base (last "G") | 146 | **719** ← `Start_Pos` |
-
-**The rule, stated plainly:** for `+` guides, `Start_Pos` is where the guide
-itself starts. For `-` guides, `Start_Pos` is where the guide's PAM ends,
-because that guide reads "backwards" relative to the plus-strand ruler.
-Either way, the single consistent rule is "smallest plus-strand column the
-23-nt footprint touches" — that's what makes the ruler shared across both
-strands; it just isn't always "the start of the spacer" once you're reading
-a minus-strand guide.
-
-## 7. CFD reference tables — the actual numbers
-
-Both tables below are the literal contents of `mismatch_score.pkl` and
-`pam_scores.pkl` — every score this tool reports is ultimately built from
-these numbers, so they're reproduced here in full rather than just
-described.
-
-### 7.1 PAM table — all 16 entries
-
-SpCas9's PAM is `NGG`: the first letter can be anything, so only the other
-two positions actually get scored. Read this table as: *if the PAM actually
-found is the row/column combination below instead of the ideal `GG`, this
-fraction of cutting activity survives* (`1.0` = as good as a perfect PAM;
-`0.0` = Cas9 essentially can't cut here).
-
-| 1st PAM letter ↓ \ 2nd PAM letter → | A | C | G | T |
-|---|---|---|---|---|
-| **A** | 0.000 | 0.000 | 0.259 | 0.000 |
-| **C** | 0.000 | 0.000 | 0.107 | 0.000 |
-| **G** | 0.069 | 0.022 | **1.000** | 0.016 |
-| **T** | 0.000 | 0.000 | 0.039 | 0.000 |
-
-(e.g. row `G`, column `G` = the key `"GG"` = activity `1.000` — the ideal
-case. Row `A`, column `G` = the key `"AG"` = activity `0.259`.) Only `GG`
-gets full activity; almost every other combination is at or near `0` — this
-is exactly why the PAM gate in section 2 exists.
-
-### 7.2 Mismatch table — 240 entries, shown as one matrix
-
-For every one of the 20 spacer positions and every one of the 12 possible
-single-base mismatches, this is how much cutting activity survives. Rows =
-spacer position (1 = guide's 5′/PAM-distal end, 20 = PAM-proximal seed).
-Columns = **guide expects → target actually has**. `1.0` = this mismatch,
-here, doesn't hurt at all; near `0.0` = this single mismatch, at this single
-position, is enough to essentially kill cutting.
-
-| Pos ↓ \ Mismatch → | A→C | A→G | A→T | C→A | C→G | C→T | G→A | G→C | G→T | T→A | T→C | T→G |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | 0.857 | 1.000 | 1.000 | 1.000 | 0.913 | 1.000 | 0.900 | 0.714 | 1.000 | 1.000 | 0.857 | 0.957 |
-| 2 | 0.786 | 0.800 | 0.727 | 0.727 | 0.696 | 0.909 | 0.846 | 0.692 | 0.636 | 0.846 | 0.857 | 0.840 |
-| 3 | 0.429 | 0.611 | 0.706 | 0.867 | 0.500 | 0.688 | 0.750 | 0.385 | 0.500 | 0.714 | 0.429 | 0.500 |
-| 4 | 0.353 | 0.625 | 0.636 | 0.842 | 0.500 | 0.800 | 0.900 | 0.529 | 0.364 | 0.476 | 0.647 | 0.625 |
-| 5 | 0.500 | 0.720 | 0.364 | 0.571 | 0.600 | 0.636 | 0.867 | 0.786 | 0.300 | 0.500 | 1.000 | 0.640 |
-| 6 | 0.455 | 0.714 | 0.714 | 0.929 | 0.500 | 0.929 | 1.000 | 0.682 | 0.667 | 0.867 | 0.909 | 0.571 |
-| 7 | 0.438 | 0.706 | 0.438 | 0.750 | 0.471 | 0.813 | 1.000 | 0.688 | 0.571 | 0.875 | 0.688 | 0.588 |
-| 8 | 0.429 | 0.733 | 0.429 | 0.650 | 0.643 | 0.875 | 1.000 | 0.615 | 0.625 | 0.800 | 1.000 | 0.733 |
-| 9 | 0.571 | 0.667 | 0.600 | 0.857 | 0.619 | 0.875 | 0.643 | 0.538 | 0.533 | 0.929 | 0.923 | 0.619 |
-| 10 | 0.333 | 0.556 | 0.882 | 0.867 | 0.389 | 0.941 | 0.933 | 0.400 | 0.813 | 0.857 | 0.533 | 0.500 |
-| 11 | 0.400 | 0.650 | 0.308 | 0.750 | 0.250 | 0.308 | 1.000 | 0.429 | 0.385 | 0.750 | 0.667 | 0.400 |
-| 12 | 0.263 | 0.722 | 0.333 | 0.714 | 0.444 | 0.538 | 0.933 | 0.529 | 0.385 | 0.800 | 0.947 | 0.500 |
-| 13 | 0.211 | 0.652 | 0.300 | 0.385 | 0.136 | 0.700 | 0.923 | 0.421 | 0.300 | 0.692 | 0.789 | 0.261 |
-| 14 | 0.214 | 0.467 | 0.533 | 0.350 | 0.000 | 0.733 | 0.750 | 0.429 | 0.267 | 0.619 | 0.286 | 0.000 |
-| 15 | 0.273 | 0.650 | 0.200 | 0.222 | 0.050 | 0.067 | 0.941 | 0.273 | 0.143 | 0.579 | 0.273 | 0.050 |
-| 16 | 0.000 | 0.192 | 0.000 | 1.000 | 0.154 | 0.308 | 1.000 | 0.000 | 0.000 | 0.909 | 0.667 | 0.346 |
-| 17 | 0.176 | 0.176 | 0.133 | 0.467 | 0.059 | 0.467 | 0.933 | 0.235 | 0.250 | 0.533 | 0.706 | 0.118 |
-| 18 | 0.190 | 0.400 | 0.500 | 0.538 | 0.133 | 0.643 | 0.692 | 0.476 | 0.667 | 0.667 | 0.429 | 0.333 |
-| 19 | 0.207 | 0.375 | 0.538 | 0.429 | 0.125 | 0.462 | 0.714 | 0.448 | 0.667 | 0.286 | 0.276 | 0.250 |
-| 20 | 0.227 | 0.765 | 0.600 | 0.500 | 0.059 | 0.300 | 0.938 | 0.429 | 0.700 | 0.563 | 0.091 | 0.176 |
-
-**How to read a single cell:** row 20, column `A→G` = `0.765` means: if the
-guide is designed expecting `A` right next to the PAM (position 20, the
-seed) but a panel variant actually has `G` there, about 76.5% of cutting
-activity survives that particular mismatch. Compare that to row 20, column
-`C→G` = `0.059` — almost total loss of activity, for a *different*
-mismatch at the *exact same position*. This is why the tool never treats
-"number of mismatches" as a single penalty: which base, mismatched to
-which other base, at which position, all matter — and this table (measured
-data, not a guess) is where every `CFD_Score_*` value ultimately comes
-from. You can regenerate this exact matrix yourself by calling
-`cfd.mm_activity(pos0, x, y, mm_scores, pam_scores)` for every position and
-base pair.
-
-## 8. Module and function reference
-
-Every file in the project, and what each function in it actually does.
-
-### `config.py`
-- **`CONFIG`** (dict) — the single source of truth for every tunable value
-  in the project: input file paths (`fasta_path`, `mm_pickle_path`,
-  `pam_pickle_path`), the enzyme's parameters (`pam`, `spacer_len`,
-  `pam_len` — all fixed for SpCas9), the two window gates (`g_max`,
-  `p_pam_min`), off-target parameters (`genome_path`, `offinder_mm`,
-  `offtarget_cfd_threshold`, `repeat_hit_threshold`), and output locations
-  (`table_path`, `plots_dir`). Nothing else in the project hardcodes these
-  values — change them here to change them everywhere.
-
-### `io_fasta.py`
-- **`read_alignment(path)`** — reads the aligned FASTA using Biopython's
-  `SeqIO`, uppercases every sequence, checks that all rows are the same
-  length (raises `ValueError` if not — a real alignment must be rectangular),
-  and returns a plain list of strings.
-- **`reverse_complement_alignment(rows)`** — returns a new list where every
-  row has been reverse-complemented via Biopython's
-  `Seq.reverse_complement()`, which correctly maps gaps to gaps and IUPAC
-  ambiguity codes to their complementary code (e.g. `M`↔`K`, `N`↔`N`). This
-  is what lets the minus strand be searched with identical logic to the
-  plus strand.
-
-### `cfd.py`
-- **`load_cfd(mm_path, pam_path)`** — unpickles both files, then identifies
-  which is the mismatch table and which is the PAM table by inspecting a
-  sample key's shape (mismatch keys look like `"rG:dA,14"`; PAM keys are
-  bare 2-letter strings like `"AG"`) rather than trusting the filenames.
-  Automatically swaps and prints a warning if they were passed in the wrong
-  order. Returns `(mm_scores, pam_scores)`.
-- **`calc_cfd(wt, sg, pam, mm_scores, pam_scores)`** — the atomic CFD score
-  (equation in section 4.3): compares two 20-mers position by position,
-  looks up a mismatch penalty for every position where they differ,
-  multiplies all of those together with the PAM's own score, and returns
-  the product.
-- **`mm_activity(pos0, guide_base, target_base, mm_scores, pam_scores)`** —
-  the activity for a single mismatch at one position: returns `1.0`
-  immediately if the bases match or `0.0` if either base is a gap;
-  otherwise builds two 20-mers that are identical everywhere except
-  `pos0`, calls `calc_cfd` on them with `pam='GG'`, and divides out
-  `pam_scores['GG']` so only the position-specific mismatch penalty
-  remains.
-- **`cfd_position_weights(mm_scores, pam_scores)`** — computes the weight
-  vector $w_i$ from section 4.3, by averaging `mm_activity` over all 12
-  possible ordered mismatch pairs at each of the 20 positions.
-
-### `columns.py`
-- **`column_frequencies(rows)`** — vectorized with numpy: stacks all rows
-  into a character array, counts `A`/`C`/`G`/`T`/`-` per column (ambiguity
-  codes are automatically excluded, since they match none of those five
-  masks), and normalizes each column's counts into frequencies. Returns
-  `(freqs, gapfrac)` — a list of per-column frequency dicts, and a
-  parallel list of just the gap fractions.
-- **`consensus(freqs)`** — for each column, returns whichever of `A/C/G/T`
-  has the highest frequency (ties broken deterministically by `A,C,G,T`
-  order); gaps and ambiguity codes are never returned as a consensus base.
-- **`entropy(freqs)`** — the Shannon entropy formula from section 4.3,
-  vectorized with numpy, returning one float per column.
-
-### `windows.py`
-- **`enumerate_windows(consensus, freqs, gapfrac, rows, strand, g_max, p_pam_min, L)`**
-  — slides a 23-column window across the given alignment, applies the gap
-  gate then the PAM gate (section 2, step 4), and for every window that
-  survives both, builds a `Window` record: the spacer sequence, the PAM
-  consensus, which alignment columns each occupies, which strand it came
-  from, its plus-strand `start_col` (via `coords.plus_coord`), and its PAM
-  conservation fraction.
-
-### `coords.py`
-- **`plus_coord(start_col, strand, L)`** — the single function responsible
-  for the shared coordinate ruler described in section 6. For `+` strand,
-  returns the column unchanged. For `-` strand, maps a window found at
-  column `j` in the mirrored alignment to plus-strand column
-  $L - (j + 23)$.
-
-### `score.py`
-- **`weighted_entropy(window, H, w)`** — implements the `Weighted_Entropy`
-  equation from section 4.3 for one window.
-- **`expected_cfd(window, rows, freqs, mm_scores, pam_scores)`** —
-  implements both `CFD_Score_Independent` and `CFD_Score_Exact` (section
-  4.3) for one window, returning both as a tuple.
-
-### `table.py`
-- **`assemble_table(windows, H, w, rows, freqs, mm_scores, pam_scores)`** —
-  scores every window (via `score.py`) and builds the final row dicts,
-  including the bare-spacer internal key (`_spacer`, used for off-target
-  matching) and the display string (`gRNA_5to3`, `SPACER(PAM)`).
-- **`merge_offtarget(out_rows, offtarget_summary)`** — fills in
-  `Offtarget_Count` / `Offtarget_Repeat_Flag` on each row by matching on its
-  `_spacer` key against `offtarget.score_offinder`'s results.
-- **`to_dataframe(out_rows)`** / **`write_table(out_rows, path)`** — build a
-  pandas `DataFrame` restricted to the public columns (internal keys like
-  `_spacer` never make it into the file) and write it out as a TSV.
-
-### `offtarget.py`
-- **`emit_offinder(guides, genome_path, out_path, mm)`** — writes a
-  Cas-OFFinder query file: the genome path, the search pattern
-  (`N`×20 + `NGG`), and one query line per guide (`"<spacer>NGG <mm>"`).
-- **`score_offinder(out_file, guides, mm_scores, pam_scores, cfd_threshold, repeat_hit_threshold)`**
-  — parses Cas-OFFinder's raw hit list, matches each hit back to the guide
-  that produced it, CFD-scores every hit (via `calc_cfd`) instead of just
-  counting raw mismatches, and returns a per-guide summary: total hit
-  count, how many scored above `cfd_threshold` (this becomes
-  `Offtarget_Count`), and whether the guide has more than
-  `repeat_hit_threshold` total hits (`n_repeat_hits`, becomes
-  `Offtarget_Repeat_Flag`).
-
-### `diagnostics.py`
-*(opt-in — meant to be called by hand on a shortlist, not run automatically
-on every candidate)*
-- **`weighted_entropy_profile(window, H, w)`** — returns the un-aggregated,
-  length-20 list of $w_i H_i$ values for one window, so you can see exactly
-  *which* position(s) are driving that guide's `Weighted_Entropy` score
-  instead of only the final aggregate number.
-- **`per_variant_distance(window, rows, mm_scores, pam_scores)`** — for
-  each of the 365 panel variants, sums $1 - \text{act}(i, g_i, \cdot)$
-  across the 20 spacer positions (a gap/ambiguity counts as maximal
-  distance, `1.0`), giving one CFD-weighted "distance from this guide's
-  consensus" number per variant.
-- **`summarize_distances(distances)`** — median and 90th percentile of that
-  distance list, a quick way to see whether one guide's distances cluster
-  tightly or split into sub-groups (possible sub-lineages).
-
-### `plotting.py`
-*(all optional — see section 10)*
-- **`compute_profiles(fasta_path)`** — loads the alignment, builds its
-  reverse complement, and returns per-column entropy for both
-  (`H_plus`, `H_minus`), per-column gap fraction for both (`gapfrac_plus`,
-  `gapfrac_minus`), and the alignment length `L`.
-- **`rolling_window_stat(H, weights, n_starts)`** — a generic sliding
-  dot-product helper: for each start position, multiplies a 20-value
-  window by a weight vector and sums it (used for the unweighted mean, the
-  CFD-weighted mean, and the gap-fraction mean curves alike).
-- **`windowed_profiles(H_plus, H_minus, L, w)`** — builds the four entropy
-  background curves (plus/minus strand × unweighted/weighted) already
-  mapped onto the shared `Start_Pos` ruler from section 6.
-- **`gap_windowed_profile(gapfrac_plus, gapfrac_minus, L)`** — the same
-  idea, for gap fraction instead of entropy: builds the plus/minus mean
-  gap-fraction curves on the same shared ruler.
-- **`plot_entropy_by_position`, `plot_window20_unweighted`, `plot_window20_weighted`, `plot_gap_fraction_window20`**
-  — draw the four figures described in section 10, including the
-  candidate-point overlay (all but the first).
-- **`generate_all_plots(out_dir, fasta_path, mm_pickle_path, pam_pickle_path, candidates)`**
-  — orchestrates all of the above and saves the four PNGs to `out_dir`.
-- **`main()`** — CLI entry point for regenerating plots standalone from an
-  existing `table.tsv`, without rerunning the whole pipeline.
-
-### `gRNADesign.py`
-- **`run_pipeline(fasta_path, mm_path, pam_path, g_max, p_pam_min)`** — the
-  core pipeline, steps 1–6 of section 2, returning the final list of row
-  dicts.
-- **`run_offtarget(out_rows, args)`** — the optional off-target
-  orchestration described in section 3 (`--genome` / `--offinder-results`),
-  mutating `out_rows` in place.
-- **`main(argv)`** — parses every flag from section 3 and wires everything
-  together: runs the pipeline, optionally runs off-target scoring, writes
-  the table, and optionally generates plots.
-
-## 9. Tests — what they check, and why
+**None of this data is in the repository.** It is large, not ours to
+redistribute, and it changes upstream. Fetch it into `input/`:
 
 ```bash
-python -m unittest discover -s tests -t .
+# 1. The reference genome: HIV-1 HXB2, GenBank K03455, 9719 nt
+curl "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=K03455.1&rettype=gbwithparts&retmode=text" \
+    -o input/K03455.gb
+
+# 2. The annotation: the LANL HXB2 landmark spreadsheet, then convert it
+curl -L https://www.hiv.lanl.gov/content/sequence/HIV/MAP/HXB2.xlsx \
+    -o input/HXB2.xlsx
+pip install openpyxl
+python tool/lanl_hxb2_gff3.py input/HXB2.xlsx input/HXB2.gff3
+
+# 3. The panel: an LTR alignment from the LANL HIV sequence database,
+#    https://www.hiv.lanl.gov/ -> Sequence Database -> Curated Alignments.
+#    Any aligned FASTA of the same region works.
 ```
 
-There are three tiers, each checking a different kind of thing that could
-otherwise go silently wrong:
+`--reference-region 1 634` pins the panel to the **5'** LTR, which is where
+that number comes from: K03455 annotates `repeat_region 1..634` as the 5' LTR,
+and position 1 of the record is its first base. The 3' LTR is the same 634 nt
+again at 9086–9719. Without the flag the anchor lands on whichever copy scores
+a hair higher and the coordinate come back about 9 kb off; see
+[section 7.3](#what---reference-region-is-for).
 
-- **`tests/test_unit.py`** — small, fast checks on individual functions
-  using hand-built toy data (not the real HIV panel), so each check
-  isolates one specific behavior:
-  - reverse-complementing a sequence twice returns the original (an
-    "involution" — if this ever fails, the minus-strand search is silently
-    broken);
-  - a column where all 5 symbols (`A,C,G,T,-`) appear equally often has
-    entropy exactly `1.0`, and a column that's the same base in every
-    sequence has entropy exactly `0.0` (the two edge cases the entropy
-    formula must get exactly right);
-  - an ambiguity code (`N`, etc.) doesn't get counted as any base when
-    computing frequencies;
-  - the gap gate and PAM gate each correctly keep/reject a window built
-    specifically to sit right on either side of the threshold.
-- **`tests/test_cfd_validation.py`** — checks specific to the CFD table,
-  and arguably the single most important test file in the project. CFD
-  data has a well-known gotcha: different implementations index the 20
-  spacer positions in opposite directions, and getting this backwards
-  doesn't crash anything — it just silently produces plausible-looking but
-  wrong scores everywhere. This file checks:
-  - scoring a guide against itself (no mismatches) returns exactly
-    `pam_scores['GG']` (the identity mentioned in section 4.3);
-  - `pam_scores['GG']` is approximately `1.0` (a perfect PAM should cost
-    essentially nothing);
-  - `cfd_position_weights()` is heavier toward the PAM-proximal end
-    (positions 13–20 average higher than positions 1–8) — if this comes
-    out reversed, the position indexing is backwards and every score in
-    the table is wrong, even though nothing would have crashed.
-- **`tests/test_integration.py`** — runs the *real* pipeline against the
-  actual FASTA panel and CFD tables (not toy data), and checks the output
-  makes sense as a whole: at least one candidate survives; every
-  candidate's `PAM_Conservation` really is above the configured threshold;
-  every guide's bare spacer is a clean 20-letter `A/C/G/T` string with no
-  leftover gaps or ambiguity codes; the `gRNA_5to3` display string is
-  correctly formatted as `SPACER(PAM)`; and running the whole pipeline
-  twice produces byte-for-byte identical output (no hidden randomness or
-  ordering nondeterminism anywhere in the pipeline).
+### Why The Annotation Needs A Separate Source
 
-If you ever change any scoring logic, running this suite is the fast way to
-find out whether you broke something — especially the CFD validation tests,
-since a CFD indexing bug is exactly the kind of mistake that won't announce
-itself any other way.
+K03455 is the 1985 submission. It carries the sequence, eight CDS under the ORF
+name of the day (`sor 23K protein` is what we now call *vif*), and each LTR as
+one undivided 634 nt block. It has no U3, R or U5 split, and no TATA box,
+NF-κB site, Sp1 site or TAR. NCBI's own GFF3 export of K03455 carries the same
+thin content, and the RefSeq record `NC_001802` begins at the transcription
+start site, so it has no U3 and no promoter element at all.
 
-## 10. Diagnostic plots (`plotting.py`)
+The LANL landmark spreadsheet is the authoritative source for those. It gives
+one row per base of HXB2 with explicit start and end marker, and
+[`tool/lanl_hxb2_gff3.py`](tool/lanl_hxb2_gff3.py) converts it to GFF3,
+recording in each line which sheet column it came from. It yields 77 feature:
 
-Entirely optional. Generate them either as part of a normal run:
+| Element | HXB2 position |
+| --- | --- |
+| U3 (5') | 1–455 |
+| TCF-1α | 315–329 |
+| NF-κB II, NF-κB I | 350–359, 364–373 |
+| Sp1 III, Sp1 II, Sp1 I | 375–386, 388–397, 398–408 |
+| TATA box | 427–431 |
+| TAR, TAR bulge, TAR loop | 453–513, 476–478, 483–488 |
+| +1 transcription start | 456 |
+| R (5') | 456–551 |
+| poly(A) signal | 527–532 |
+| U5 (5'), U5 binding region | 552–634, 560–570 |
+| PBS | 636–653 |
 
-```bash
-python gRNADesign.py my_panel.fasta results.tsv --plots plots/
+plus the Psi packaging stem-loop, the RRE and its stem, the polypurine tract,
+the Gag, Pol and Env mature peptide (p17, p24, p7, protease, RT, RNase,
+integrase, gp120, gp41), and both Tat and Rev exon.
+
+### What LANL Does Not Publish
+
+A drawn LTR map often also shows AP-1, NFAT, COUP-TF, C/EBP, USF-1,
+Ets-1/RBF-1, RBEIII, NRT-1, GATA and NF-1/CREB-ATF across the modulatory region
+in the 5' half of U3. **Those are not in the LANL landmark spreadsheet, and not
+in the LANL HXB2 Feature Database either** — its full 358 name feature
+vocabulary contains NF-κB, Sp1, TATA, TCF-1α and the PBS, and none of the
+others. They come from the primary literature as interval relative to the
+transcription start, not as a coordinate set anyone distributes.
+
+So they are left out rather than guessed at. If you have a citable coordinate,
+add it as an extra GFF3 line and it will be picked up and drawn with everything
+else:
+
+```
+K03455.1	yourcitation	protein_binding_site	<start>	<end>	.	+	.	Name=AP-1 I
 ```
 
-or standalone, from an existing table, without rerunning the pipeline:
+### A Provenance Caution
 
-```bash
-python plotting.py --table results.tsv --out-dir plots/
-```
+LANL and the GenBank record disagree by one base on where R begins: LANL marks
+the transcription start at 456, the GenBank mRNA feature begins at 455. The
+converted GFF3 follows LANL throughout, since mixing the two would be worse
+than either. Expect a one base offset against a source that follows GenBank.
 
-Four figures are produced, all sharing the same `Start_Pos` ruler as the
-main table, with a dashed gridline every 100 columns to make positions easy
-to read off:
 
-1. **`entropy_by_position.png`** — raw per-column Shannon entropy across the
-   whole alignment, both strands. (The two strands' lines coincide almost
-   exactly — entropy doesn't change under complementation, so this is
-   expected, not a bug.)
-2. **`entropy_window20_unweighted.png`** — plain mean entropy over every
-   possible 20-column spacer window (a continuous version of the
-   conservation signal, computed everywhere along the genome, not just at
-   the surviving gated candidates).
-3. **`entropy_window20_weighted.png`** — CFD-seed-weighted mean entropy
-   over every 20-column window — this is exactly `Weighted_Entropy`,
-   computed continuously instead of only at the candidate windows that
-   passed the gates.
-4. **`gap_fraction_window20.png`** — mean gap (`-`) fraction over every
-   20-column spacer window, i.e. what fraction of the 365 panel variants
-   have an actual deletion there (gap count / total sequences). This is the
-   same quantity the gap gate (`g_max`, section 2) filters on, computed
-   continuously along the whole genome instead of only as a pass/fail
-   check — the tall spikes up to `1.0` are regions where most of the panel
-   has a deletion (commonly variable-length loop regions), and every
-   surviving candidate correctly clusters near `0.0`, since the gap gate
-   only lets through windows with almost no gaps.
+## 12. Limitation
 
-On plots 2, 3, and 4, every surviving candidate is overlaid as a point:
-marker **shape** encodes `Derived_Strand` (circle = `+`, triangle = `-`),
-and marker **color** encodes `CFD_Score_Exact` (see the color bar) — so you
-can see at a glance both where a guide sits in the conservation/gap
-landscape and how good its predicted cutting activity is.
+- **No off-target search.** Every score here comes from the panel alignment
+  only. A guide can be perfectly conserved in the target and still cut the host
+  genome. Screen a shortlist with Cas-OFFinder or CRISPOR against the host
+  genome before ordering anything.
+- **The panel is the population.** Every metric inherits whatever bias the
+  alignment carries. A panel over-representing one subtype reports conservation
+  for that subtype, not for the species.
+- **CFD is a model.** It predicts relative cutting from a mismatch table, not
+  from your experiment, and it was trained on SpCas9. For another nuclease,
+  entropy, PAM conservation, position and annotation stay valid; CFD's mismatch
+  term does not, and at a spacer length other than 20 it is not computed at
+  all.
+- **MFE is the guide alone by default.** The spacer is folded without the
+  scaffold unless `--scaffold` is given, and without the target.
+- **Annotation is only as good as its source.** The tool reports what the file
+  says. It does not validate a coordinate against the sequence.
 
-## 11. Credits
 
-The CFD (Cutting Frequency Determination) lookup tables bundled here
-(`mismatch_score.pkl`, `pam_scores.pkl`) are not this project's own data —
-they are the published, experimentally-measured scores from:
+## 13. Reference
 
-> Doench, J. G., Fusi, N., Sullender, M., Hegde, M., Vaimberg, E. W., Donovan, K. F., Smith, I., Tothova, Z., Wilen, C., Orchard, R., Virgin, H. W., Listgarten, J., & Root, D. E. (2016). Optimized sgRNA design to maximize activity and minimize off-target effects of CRISPR-Cas9. Nature biotechnology, 34(2), 184–191. https://doi.org/10.1038/nbt.3437
-
-These are the same numbers used by [CRISPOR](https://github.com/maximilianh/crisporWebsite/tree/master/CFD_Scoring), and
-are reproduced here in full in section 7 for transparency. All credit for
-the underlying measurements belongs to Doench et al.; this project only
-consumes the tables (`cfd.py`) to score conservation across the HIV-1 panel.
+- Doench, J. G. et al. Optimized sgRNA design to maximize activity and minimize
+  off-target effects of CRISPR-Cas9. *Nature Biotechnology* **34**, 184–191
+  (2016). The CFD model.
+- Lorenz, R. et al. ViennaRNA Package 2.0. *Algorithms for Molecular Biology*
+  **6**, 26 (2011). The folding model behind RNAfold.
+- Gruber, A. R. et al. The Vienna RNA Websuite. *Nucleic Acids Research* **36**,
+  W70–W74 (2008). The server used when ViennaRNA is not installed locally.
+- Mathews, D. H. et al. Incorporating chemical modification constraints into a
+  dynamic programming algorithm for prediction of RNA secondary structure.
+  *PNAS* **101**, 7287–7292 (2004). The Turner 2004 parameter.
+- Ratner, L. et al. Complete nucleotide sequence of the AIDS virus, HTLV-III.
+  *Nature* **313**, 277–284 (1985). GenBank K03455.
+- Los Alamos National Laboratory HIV Sequence Database,
+  [HXB2 landmark spreadsheet](https://www.hiv.lanl.gov/content/sequence/HIV/MAP/HXB2.xlsx).
+  The HIV-1 annotation used in section 11.

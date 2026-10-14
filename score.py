@@ -1,58 +1,68 @@
-"""Scoring: weighted conservation (entropy) and expected CFD.
+"""The per candidate metric.
 
-Kept as two separate columns downstream — they answer different questions
-(conservation vs. mismatch tolerance) and must not be fused. See
-README.md section 2.
+Conservation (entropy), PAM conservation and cutting tolerance (CFD) are kept
+as separate column on purpose. They answer different question and must never
+be fused into one number.
 """
 
-from cfd import mm_activity, calc_cfd
+import numpy as np
 
-_ACGT = ("A", "C", "G", "T")
-
-
-def weighted_entropy(window, H, w):
-    """S = sum(w_i * H[spacer_cols[i]]) / sum(w_i). Weighted mean entropy in
-    [0,1]; lower = more conserved where it matters (seed-weighted)."""
-    num = sum(w[i] * H[window.spacer_cols[i]] for i in range(20))
-    den = sum(w)
-    return num / den
+import cfd
+from pam import motif_mask
 
 
-def expected_cfd(window, rows, freqs, mm_scores, pam_scores):
-    """Returns (e_indep, e_exact), both in [0,1].
+def entropy_mean(entropy, column):
+    r"""Plain mean Shannon entropy over the spacer column.
 
-    e_indep: per-position activities combined assuming column independence.
-    e_exact: mean CFD score against each variant's actual spacer+PAM, no
-        independence assumption. Divergence between the two is a
-        subtype-clustering signal.
+    \bar{H} = (1/L) \sum_{j \in spacer} H_j, in [0, 1]. Lower is more
+    conserved across the panel.
     """
-    g = window.spacer
-    spacer_cols = window.spacer_cols
+    return float(np.mean(entropy[column]))
 
-    # --- e_indep ---
-    e_indep = 1.0
-    for i in range(20):
-        col = spacer_cols[i]
-        f = freqs[col]
-        a_i = sum(
-            f[b] * mm_activity(i, g[i], b, mm_scores, pam_scores)
-            for b in _ACGT
-        )
-        # gap contributes 0 via mm_activity(i, g[i], '-') = 0; ambiguity
-        # codes were already excluded from freqs' denominator.
-        e_indep *= a_i
 
-    # --- e_exact ---
-    pam_col_1, pam_col_2 = window.pam_cols[1], window.pam_cols[2]
-    total = 0.0
-    for row in rows:
-        variant_spacer = "".join(row[c] for c in spacer_cols)
-        if any(b not in _ACGT for b in variant_spacer):
-            continue  # activity 0: gap/ambiguity in spacer window
-        variant_pam = row[pam_col_1] + row[pam_col_2]
-        if variant_pam not in pam_scores:
-            continue  # activity 0: not a valid PAM key
-        total += calc_cfd(g, variant_spacer, variant_pam, mm_scores, pam_scores)
-    e_exact = total / len(rows) if rows else 0.0
+def cfd_mean(matrix, candidate, motif, table, pam_score):
+    r"""Mean CFD of the consensus guide against every aligned sequence here.
 
-    return e_indep, e_exact
+    \overline{CFD} = (1/N) \sum_k CFD(guide, variant_k) and, for one variant,
+
+        CFD = PAM(variant PAM) * \prod_{i=1}^{20} a_i(guide_i, variant_i)
+
+    where a_i is the position specific mismatch activity. A variant carrying a
+    gap or an ambiguity code inside the protospacer, or lacking a usable PAM,
+    scores 0 and still counts in the denominator, so the mean is over the
+    whole panel.
+
+    Returns nan when the spacer length puts it outside the published model.
+    """
+    if table is None:
+        return float("nan")
+
+    index = {base: position for position, base in enumerate(cfd.BASE)}
+    product = np.ones(matrix.shape[0])
+    for offset, column in enumerate(candidate.spacer_column):
+        guide_base = candidate.spacer[offset]
+        if guide_base not in index:
+            return 0.0
+        product *= table[offset, index[guide_base]][matrix[:, column]]
+
+    return float(np.mean(product * pam_factor(matrix, candidate, motif, pam_score)))
+
+
+def pam_factor(matrix, candidate, motif, pam_score):
+    """Per variant PAM factor.
+
+    SpCas9 NGG uses the published CFD PAM table on the GG dinucleotide. Any
+    other motif falls back to a 1 or 0 motif match, because the CFD PAM table
+    is SpCas9 specific and says nothing about another nuclease.
+    """
+    column = candidate.pam_column
+    if motif.upper() == "NGG" and len(column) == 3:
+        key = (matrix[:, column[1]].astype(np.int32) * 256
+               + matrix[:, column[2]].astype(np.int32))
+        return cfd.pam_lookup(pam_score)[key]
+
+    mask = motif_mask(motif)
+    factor = np.ones(matrix.shape[0], dtype=bool)
+    for position, index in enumerate(column):
+        factor &= mask[position][matrix[:, index]]
+    return factor.astype(float)

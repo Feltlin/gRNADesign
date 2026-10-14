@@ -1,201 +1,361 @@
 #!/usr/bin/env python
-"""HIV-1 LTR gRNA Designer -- CLI entry point.
+"""gRNA Designer - command line entry point.
 
-Pipeline (see README.md section 2 for the numbered workflow and section 4
-for the output column glossary):
-    load alignment
-      -> column frequencies (+ gap fraction)        [plus and RC alignment separately]
-      -> consensus (per column, majority ACGT)
-      -> per-column Shannon entropy                 [conservation track]
-      -> enumerate 23-col windows, both strands
-          gate: gap content low AND GG present      [drop failing windows here]
-      -> per surviving window: S, E[CFD] indep/exact, GG fraction, plus-frame coordinate
-      -> assemble table
-      -> (optional, only if --genome or --offinder-results given) off-target
-      -> (optional, only if --plots given) diagnostic plots
+Design a guide RNA panel from an aligned sequence set, a PAM motif and an
+annotated reference. See README.md, "Data Process", for the step below in
+detail.
 
-Off-target scoring is entirely optional: without a reference genome there is
-nothing to search against, so Offtarget_Count / Offtarget_Repeat_Flag are
-just left blank.
+    read the alignment
+      -> per column frequency, consensus and Shannon entropy
+      -> anchor the panel to the annotated reference
+      -> slide a (spacer + PAM) window over both strand
+           gate: gap content low, consensus PAM matches, PAM present in the panel
+      -> per surviving window: entropy mean, PAM conservation, mean CFD
+      -> (optional) fold each guide for its MFE and structure
+      -> write the table
+      -> (optional) draw the candidate map
+      -> (optional) write the consensus FASTA
 
 Usage:
-    python gRNADesign.py in.fasta out.tsv
-    python gRNADesign.py in.fasta out.tsv --genome /path/to/GRCh38_dir
-    python gRNADesign.py in.fasta out.tsv --offinder-results cas_offinder_out.txt
-    python gRNADesign.py in.fasta out.tsv --plots plots/
+    python gRNADesign.py
+    python gRNADesign.py input/panel.fasta output/gRNA_table.tsv
+    python gRNADesign.py --pam NGG --reference input/K03455.gb --plot
+    python gRNADesign.py --mfe --plot --consensus
 """
 
 import argparse
-import shutil
-import subprocess
 import sys
 import time
 
+import numpy as np
+
+import alignment as aln
+import annotation
+import cfd
+import mfe as mfe_module
+import plot as plot_module
+import report
+import score as score_module
 from config import CONFIG
-from io_fasta import read_alignment, reverse_complement
-from columns import column_frequencies, consensus, entropy
-from cfd import load_cfd, cfd_position_weights
-from windows import enumerate_windows
-from table import assemble_table, write_table, merge_offtarget
-from offtarget import emit_offinder, score_offinder
+from pam import enumerate_candidate
 
 
+def design(
+    alignment_path,
+    reference_path,
+    *,
+    mismatch_table_path,
+    pam_table_path,
+    pam,
+    pam_side,
+    spacer_length,
+    max_gap_fraction,
+    min_pam_fraction,
+    reference_region,
+    core_gap_fraction,
+    annotation_path=None,
+    feature_alias=None,
+    log=print,
+):
+    """Run the pipeline and return (row, context) where context carries what
+    the plot and the run log need."""
+    started = time.time()
 
-def run_pipeline(fasta_path, mm_path, pam_path, g_max, p_pam_min):
-    t0 = time.time()
+    log("Step 1/5  Read the alignment")
+    panel = aln.read_alignment(alignment_path)
+    log(f"  {alignment_path}")
+    log(f"  {panel.depth} sequence x {panel.length} column")
 
-    print("Step 1/6: Loading alignment & building reverse complement")
-    print(f"Reading {fasta_path}")
-    rows_plus = read_alignment(fasta_path)
-    L = len(rows_plus[0])
-    print(f"  loaded {len(rows_plus)} sequences x {L} columns")
+    log("Step 2/5  Per column frequency, consensus and Shannon entropy")
+    frequency, gap_fraction = aln.column_frequency(panel.matrix)
+    consensus = aln.consensus(frequency)
+    entropy = aln.shannon_entropy(frequency)
+    log(f"  mean H {entropy.mean():.4f}, mean gap fraction {gap_fraction.mean():.4f}")
 
-    print("Building reverse-complement alignment (for minus-strand search)")
-    rows_minus = reverse_complement(rows_plus)
-    print("  Done")
+    # Equal row length is necessary for an alignment but not sufficient: a set
+    # of unaligned sequence all trimmed to the same length passes that check
+    # and then scores nonsense, because the column do not correspond. A real
+    # alignment either carries gap or is highly conserved; carrying neither is
+    # the signature of input that was never aligned.
+    if entropy.mean() > 0.30 and gap_fraction.mean() < 0.001:
+        log(f"  WARNING: mean column entropy is {entropy.mean():.2f} and there "
+            f"is essentially no gap. That combination usually means the input "
+            f"is not actually aligned, only equal in length. Align the panel "
+            f"first (MAFFT, MUSCLE, or whatever your field uses) and rerun. "
+            f"If the panel really is this diverse, ignore this.")
+
+    log("Step 3/5  Anchor the panel to the annotated reference")
+    reference = None
+    mapping = np.full(panel.length, -1, dtype=np.int64)
+    note = "not anchored, no reference given"
+
+    if reference_path is None:
+        log("  no --reference given: the position and annotation column are "
+            "left empty. Every score is unaffected, since all of them are "
+            "computed from the panel alone")
+    else:
+        reference = annotation.load_reference(
+            reference_path, reference_region, annotation_path, feature_alias)
+        log(f"  {reference_path}"
+            + (f" + {annotation_path}" if annotation_path else ""))
+        log(f"  {reference.identifier}  {reference.full_length} nt, "
+            f"{len(reference.feature)} annotated span")
+
+        orientation, forward_score, reverse_score = annotation.detect_orientation(
+            consensus, gap_fraction, reference, core_gap_fraction)
+        if orientation == "reverse":
+            log(f"  the panel is the reverse complement of the reference "
+                f"(probe score {reverse_score:.0f} against {forward_score:.0f}); "
+                f"flipping it so every reported coordinate and strand is in "
+                f"reference orientation")
+            panel = aln.Alignment(panel.identifier,
+                                  aln.reverse_complement(panel.matrix))
+            frequency, gap_fraction = aln.column_frequency(panel.matrix)
+            consensus = aln.consensus(frequency)
+            entropy = aln.shannon_entropy(frequency)
+
+        mapping, note = annotation.map_column(
+            consensus, gap_fraction, reference, core_gap_fraction)
+        log(f"  anchored to {note}")
+
+        anchored = int((mapping >= 0).sum())
+        if anchored < 0.5 * panel.length:
+            log(f"  WARNING: only {anchored} of {panel.length} column anchored. "
+                f"The panel and the reference may not be the same locus, or the "
+                f"panel may cover only part of it. Check the span above before "
+                f"trusting any coordinate.")
+
+    log(f"Step 4/5  Slide the {spacer_length} + {len(pam)} nt window over both strand")
+    mismatch_score, pam_score = cfd.load_table(mismatch_table_path, pam_table_path)
+    table = cfd.activity_table(mismatch_score, pam_score, spacer_length)
+    if table is None:
+        log(f"  note: CFD is defined for a 20 nt spacer only, so the CFD column "
+            f"is left empty for this {spacer_length} nt spacer")
+
+    candidate = []
+    for strand, matrix in (("+", panel.matrix),
+                           ("-", aln.reverse_complement(panel.matrix))):
+        if strand == "+":
+            strand_frequency, strand_gap = frequency, gap_fraction
+        else:
+            strand_frequency, strand_gap = aln.column_frequency(matrix)
+        found = enumerate_candidate(
+            matrix, strand_gap, aln.consensus(strand_frequency), pam, strand,
+            spacer_length=spacer_length,
+            pam_side=pam_side,
+            max_gap_fraction=max_gap_fraction,
+            min_pam_fraction=min_pam_fraction,
+        )
+        log(f"  [{strand} strand] {len(found)} window survived every gate")
+        candidate.extend((entry, matrix) for entry in found)
+
+    log("Step 5/5  Score every surviving window")
+    row = []
+    for entry, matrix in candidate:
+        reference_span = annotation.span(mapping, entry.plus_spacer_column)
+        gene, element = (annotation.annotate(reference, *reference_span)
+                         if reference is not None else ("", ""))
+        row.append(report.build_row(
+            entry,
+            entropy_mean=score_module.entropy_mean(entropy, entry.plus_spacer_column),
+            cfd_score=score_module.cfd_mean(matrix, entry, pam, table, pam_score),
+            reference_span=reference_span,
+            gene=gene,
+            element=element,
+        ))
+    anchored = sum(1 for entry in row if entry["Ref_Start"] is not None)
+    log(f"  {len(row)} candidate, {anchored} with a reference coordinate "
+        f"({time.time() - started:.1f}s)")
+
+    context = {
+        "panel": panel,
+        "consensus": consensus,
+        "entropy": entropy,
+        "gap_fraction": gap_fraction,
+        "mapping": mapping,
+        "reference": reference,
+        "anchor_note": note,
+    }
+    return row, context
 
 
-
-    print("Step 2/6: Loading CFD tables & deriving position weights")
-    print(f"Reading {mm_path} & {pam_path} ...")
-    mm_scores, pam_scores = load_cfd(mm_path, pam_path)
-    print(f"  Mismatch table: {len(mm_scores)} keys; PAM table: {len(pam_scores)} keys")
-
-    print("Computing per-position CFD weights (seed-heavy weighting vector) ...")
-    w = cfd_position_weights(mm_scores, pam_scores)
-    print("  Done")
-
-
-
-    print("Step 3/6: Column statistics + window enumeration, both strands")
-    all_windows = []
-    for strand, rows in (("+", rows_plus), ("-", rows_minus)):
-        print(f"[{strand} strand] computing base frequencies, consensus, entropy ...")
-        freqs, gapfrac = column_frequencies(rows)
-        cons = consensus(freqs)
-        H = entropy(freqs)
-
-        print(f"[{strand} strand] sliding the 23-col window and applying gap/PAM gates ...")
-        wins = enumerate_windows(cons, freqs, gapfrac, rows, strand, g_max, p_pam_min, L=L)
-        print(f"[{strand} strand] {len(wins)} windows survived both gates")
-
-        all_windows.extend((win, freqs, rows, H) for win in wins)
-
-
-
-    print("Step 4/6: Scoring surviving windows")
-    print(f"Scoring {len(all_windows)} surviving window(s) "
-          f"(Weighted_Entropy + CFD_Score_Independent/Exact for each) ...")
-    out_rows = []
-    for n, (win, freqs, rows, H) in enumerate(all_windows, start=1):
-        out_rows.extend(assemble_table([win], H, w, rows, freqs, mm_scores, pam_scores))
-        if n % 10 == 0 or n == len(all_windows):
-            print(f"  scored {n}/{len(all_windows)}")
-
-    print(f"\nTotal candidates: {len(out_rows)}  (pipeline took {time.time() - t0:.1f}s)")
-
-    return out_rows
-
-
-def run_offtarget(out_rows, args):
-    """Optional stage: only runs if a genome to search,
-    or an already-generated Cas-OFFinder result file to score provided.
-    Mutates out_rows in place (fills Offtarget_Count / Offtarget_Repeat_Flag).
-    """
-
-    print("Step 5/6 (optional): Off-target scoring")
-    guides = [r["_spacer"] for r in out_rows]
-    print(f"{len(guides)} guide(s) to check; loading CFD tables ...")
-    mm_scores, pam_scores = load_cfd(args.mm_pickle, args.pam_pickle)
-
-    offinder_out_file = args.offinder_results
-
-    if offinder_out_file is None and args.genome:
-        query_path = args.offinder_query or (args.out + ".offinder_in.txt")
-        print(f"Writing Cas-OFFinder query file (genome: {args.genome}, mm={args.offinder_mm}) ...")
-        emit_offinder(guides, args.genome, query_path, mm=args.offinder_mm)
-        print(f"  wrote {query_path}")
-
-        cas_offinder_bin = shutil.which("cas-offinder")
-        if cas_offinder_bin is None:
-            print(
-                "cas-offinder not found on PATH -- run it manually, then rerun "
-                f"this tool with --offinder-results <output>:\n"
-                f"  cas-offinder {query_path} C <cas_offinder_out>"
-            )
-            return
-        offinder_out_file = query_path + ".out"
-        print(f"Running Cas-OFFinder (this can take a while on a full genome): "
-              f"{cas_offinder_bin} {query_path} C {offinder_out_file}")
-        subprocess.run([cas_offinder_bin, query_path, "C", offinder_out_file], check=True)
-        print("  Cas-OFFinder finished")
-
-    if offinder_out_file is None:
-        print("No genome and no existing results given -- nothing to score.")
-        return
-
-    print(f"Parsing and CFD-scoring hits from {offinder_out_file} ...")
-    summary = score_offinder(
-        offinder_out_file, guides, mm_scores, pam_scores,
-        cfd_threshold=CONFIG["offtarget_cfd_threshold"],
-        repeat_hit_threshold=CONFIG["repeat_hit_threshold"],
+def add_fold(row, argument, log=print):
+    """Fold every distinct guide and merge its MFE and structure in."""
+    log("Bonus  Fold each guide for its minimum free energy")
+    folded = mfe_module.fold(
+        [entry["_spacer"] for entry in row],
+        backend=argument.mfe_backend,
+        url=argument.mfe_url,
+        temperature=argument.mfe_temperature,
+        worker=argument.mfe_worker,
+        cache_path=argument.mfe_cache,
+        scaffold=argument.scaffold,
+        log=log,
     )
-    merge_offtarget(out_rows, summary)
-    n_flagged = sum(1 for g in guides if summary[g]["n_repeat_hits"])
-    print(f"  done: {sum(s['hits'] for s in summary.values())} total genomic hits parsed, "
-          f"{n_flagged} guide(s) flagged as high-repeat")
+    return report.merge_fold(row, folded)
+
+
+def draw(row, context, argument, log=print):
+    """Draw the candidate map."""
+    log("Bonus  Draw the candidate map")
+    frame = report.to_frame(row)
+    mapping = context["mapping"]
+    reference = context["reference"]
+
+    running = aln.running_mean(context["entropy"], argument.entropy_window)
+    anchored = mapping >= 0
+    position = mapping[anchored] + 1
+    value = running[anchored]
+    order = np.argsort(position)
+
+    side = "3" if argument.pam_side == "3prime" else "5"
+    best = frame["CFD_Score"].max()
+    descriptor = reference.description.split(";")[0].strip()
+    span = f"{reference.offset + 1}-{reference.offset + len(reference.sequence)}"
+    subtitle = (
+        f"{descriptor}  ·  {reference.identifier} {span}\n"
+        f"{context['panel'].depth} aligned sequence  ·  PAM {argument.pam} "
+        f"{side}' of a {argument.spacer_length} nt spacer  ·  "
+        f"{len(frame)} candidate past the gate, best CFD {best:.2f}"
+    )
+    footnote = (
+        "Entropy and CFD are independent: entropy is how conserved the locus is "
+        "across the panel, CFD is how well the one consensus guide still cuts "
+        "every variant at that locus.\n"
+        "Arrow points 5' to 3' along the strand the protospacer is read from. "
+        "Score come from the panel alignment only, not from a genome wide off "
+        "target search; screen a shortlist against the host genome before "
+        "ordering.\n"
+        f"Anchored to {context['anchor_note']}."
+    )
+    path = plot_module.draw(
+        frame, position[order], value[order], reference, argument.plot,
+        window=argument.entropy_window,
+        cfd_line=argument.cfd_line,
+        title="gRNA candidate map",
+        subtitle=subtitle,
+        footnote=footnote,
+    )
+    log(f"  wrote {path}")
+    return path
+
+
+def parse(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Design a guide RNA panel from an aligned sequence set, "
+                    "a PAM motif and an annotated reference.")
+    parser.add_argument("alignment",
+                        help="aligned FASTA panel, every row the same length")
+    parser.add_argument("out", nargs="?", default=str(CONFIG["table_path"]),
+                        help="output TSV path (default: %(default)s)")
+    parser.add_argument("--reference", default=CONFIG["reference_path"],
+                        help="annotated reference, GenBank or FASTA. Without "
+                             "it the position and annotation column are left "
+                             "empty and every score is unchanged")
+    parser.add_argument("--annotation", default=CONFIG["annotation_path"],
+                        help="separate GFF3, GTF or BED annotation; use it when "
+                             "the reference is a plain FASTA")
+    parser.add_argument("--reference-region", nargs=2, type=int, metavar=("START", "END"),
+                        default=CONFIG["reference_region"],
+                        help="RESTRICT anchoring to this span of the reference, "
+                             "1 based with both end included. Omit it to search "
+                             "the whole reference, which is the usual case. Use "
+                             "it only when the panel matches a repeated element "
+                             "and you must say which copy")
+
+    nuclease = parser.add_argument_group("nuclease")
+    nuclease.add_argument("--pam", default=CONFIG["pam"],
+                          help="IUPAC PAM motif (default: %(default)s)")
+    nuclease.add_argument("--pam-side", choices=("3prime", "5prime"),
+                          default=CONFIG["pam_side"],
+                          help="side of the spacer the PAM sits on "
+                               "(default: %(default)s)")
+    nuclease.add_argument("--spacer-length", type=int, default=CONFIG["spacer_length"])
+
+    gate = parser.add_argument_group("gate")
+    gate.add_argument("--max-gap-fraction", type=float,
+                      default=CONFIG["max_gap_fraction"])
+    gate.add_argument("--min-pam-fraction", type=float,
+                      default=CONFIG["min_pam_fraction"])
+    gate.add_argument("--core-gap-fraction", type=float,
+                      default=CONFIG["core_gap_fraction"])
+
+    folding = parser.add_argument_group(
+        "minimum free energy (off unless --mfe is given)")
+    folding.add_argument("--mfe", action="store_true",
+                         help="fold every guide; uses a local ViennaRNA install "
+                              "when available, otherwise the public RNAfold server")
+    folding.add_argument("--mfe-backend", choices=("auto", "local", "server"),
+                         default=CONFIG["mfe_backend"])
+    folding.add_argument("--mfe-url", default=CONFIG["mfe_url"])
+    folding.add_argument("--mfe-temperature", type=float,
+                         default=CONFIG["mfe_temperature"])
+    folding.add_argument("--mfe-worker", type=int, default=CONFIG["mfe_worker"])
+    folding.add_argument("--mfe-cache", default=str(CONFIG["mfe_cache_path"]))
+    folding.add_argument("--scaffold", default=CONFIG["scaffold"],
+                         help="appended to the spacer before folding; empty "
+                              "folds the spacer alone")
+
+    output = parser.add_argument_group("extra output")
+    output.add_argument("--plot", metavar="PATH", nargs="?",
+                        const=str(CONFIG["plot_path"]), default=None,
+                        help="draw the candidate map (default: %(const)s)")
+    output.add_argument("--entropy-window", type=int, default=CONFIG["entropy_window"],
+                        help="running mean window for the entropy line "
+                             "(default: %(default)s)")
+    output.add_argument("--cfd-line", type=float, default=CONFIG["cfd_reference_line"],
+                        help="CFD reference line drawn on the map "
+                             "(default: %(default)s)")
+    output.add_argument("--consensus", metavar="PATH", nargs="?",
+                        const=str(CONFIG["consensus_path"]), default=None,
+                        help="write the panel consensus FASTA (default: %(const)s)")
+    return parser.parse_args(argv)
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="HIV-1 LTR gRNA Designer")
-    parser.add_argument("fasta", nargs="?", default=CONFIG["fasta_path"],
-                         help="Aligned FASTA panel (default: %(default)s)")
-    parser.add_argument("out", nargs="?", default=CONFIG["table_path"],
-                         help="Output TSV path (default: %(default)s)")
-    parser.add_argument("--mm-pickle", default=CONFIG["mm_pickle_path"])
-    parser.add_argument("--pam-pickle", default=CONFIG["pam_pickle_path"])
-    parser.add_argument("--g-max", type=float, default=CONFIG["g_max"])
-    parser.add_argument("--p-pam-min", type=float, default=CONFIG["p_pam_min"])
+    argument = parse(argv)
 
-    offtarget_group = parser.add_argument_group(
-        "off-target (optional -- skipped entirely if neither is given)")
-    offtarget_group.add_argument(
-        "--genome", default=CONFIG["genome_path"],
-        help="Path to an unmasked reference genome (e.g. GRCh38) to search against")
-    offtarget_group.add_argument(
-        "--offinder-query", default=None,
-        help="Where to write the Cas-OFFinder query file (default: <out>.offinder_in.txt)")
-    offtarget_group.add_argument(
-        "--offinder-results", default=None,
-        help="An already-generated Cas-OFFinder output file to score, skipping the search")
-    offtarget_group.add_argument("--offinder-mm", type=int, default=CONFIG["offinder_mm"])
+    row, context = design(
+        argument.alignment,
+        argument.reference,
+        mismatch_table_path=CONFIG["mismatch_table_path"],
+        pam_table_path=CONFIG["pam_table_path"],
+        pam=argument.pam,
+        pam_side=argument.pam_side,
+        spacer_length=argument.spacer_length,
+        max_gap_fraction=argument.max_gap_fraction,
+        min_pam_fraction=argument.min_pam_fraction,
+        reference_region=argument.reference_region,
+        core_gap_fraction=argument.core_gap_fraction,
+        annotation_path=argument.annotation,
+        feature_alias=CONFIG["feature_alias"],
+    )
 
-    parser.add_argument("--plots", metavar="OUT_DIR", nargs="?",
-                         const=CONFIG["plots_dir"], default=None,
-                         help="Also write the 3 diagnostic plots to OUT_DIR "
-                              "(defaults to %(const)s if OUT_DIR is omitted)")
-    args = parser.parse_args(argv)
+    if not row:
+        print("No window survived the gate; nothing to write.")
+        return 1
 
-    out_rows = run_pipeline(args.fasta, args.mm_pickle, args.pam_pickle,
-                             args.g_max, args.p_pam_min)
-
-    if args.genome or args.offinder_results:
-        run_offtarget(out_rows, args)
+    if argument.mfe:
+        add_fold(row, argument)
     else:
-        print("Step 5/6 (optional): Off-target scoring")
-        print("No --genome or --offinder-results given; skipping.")
+        print("Bonus  Minimum free energy: --mfe not given, column left empty")
 
-    print("Step 6/6: Writing output table")
-    write_table(out_rows, args.out)
-    print(f"Wrote {len(out_rows)} rows to {args.out}")
+    path = report.write_table(row, argument.out)
+    print(f"Wrote {len(row)} row to {path}")
 
-    if args.plots:
-        print("Bonus step (optional): Generating diagnostic plots")
-        from plotting import generate_all_plots
-        generate_all_plots(args.plots, args.fasta, args.mm_pickle, args.pam_pickle, out_rows)
+    if argument.plot and context["reference"] is None:
+        print("Bonus  Candidate map: skipped, because the map is drawn against "
+              "reference coordinate and no --reference was given")
+    elif argument.plot:
+        draw(row, context, argument)
+
+    if argument.consensus:
+        written = aln.write_fasta(
+            context["consensus"], argument.consensus,
+            header=f"consensus {context['panel'].depth} sequence")
+        print(f"Wrote the {len(context['consensus'])} nt consensus to {written}")
 
     print("Done")
-
     return 0
 
 
